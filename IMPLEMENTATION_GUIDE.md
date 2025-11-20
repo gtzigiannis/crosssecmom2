@@ -3,7 +3,7 @@
 ## Overview
 
 This refactored system implements a rigorous cross-sectional momentum research framework with:
-- ✅ **Zero look-ahead bias**: All supervised operations (binning, feature selection, model training) use only training window data
+- ✅ **No look-ahead bias**: All supervised operations (binning, feature selection, model training) use only training window data
 - ✅ **Proper time structure**: Explicit FEATURE_MAX_LAG_DAYS, TRAINING_WINDOW_DAYS, HOLDING_PERIOD_DAYS, STEP_DAYS
 - ✅ **Model-agnostic interface**: Works with any alpha model via train/score pattern
 - ✅ **ADV-based liquidity filtering**: Replaces VPT with proper dollar volume metric
@@ -235,7 +235,7 @@ class MyCustomModel(AlphaModel):
         
         return scores
 
-# Train your model
+# Train the model
 def train_my_model(panel, metadata, t_train_start, t_train_end, config):
     # Extract training window
     train_data = panel.loc[t_train_start:t_train_end]
@@ -250,7 +250,7 @@ def train_my_model(panel, metadata, t_train_start, t_train_end, config):
 ### Using in Backtest
 
 ```python
-# Register your model in alpha_models.py train_alpha_model function
+# Register the model in alpha_models.py train_alpha_model function
 # or call directly:
 
 model = train_my_model(panel, metadata, t_train_start, t_train_end, config)
