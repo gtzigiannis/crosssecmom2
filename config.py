@@ -15,15 +15,15 @@ class PathConfig:
     """File paths for data inputs and outputs."""
     
     # Input paths
-    universe_csv: str = r"C:\REPOSITORY\Models\etf_universe_names.csv"
-    universe_metadata_csv: str = r"C:\REPOSITORY\Models\etf_universe_full.csv"  # Full metadata with families
+    universe_csv: str = r"D:\REPOSITORY\Data\crosssecmom2\etf_universe_names.csv"
+    universe_metadata_csv: str = r"D:\REPOSITORY\Data\crosssecmom2\etf_universe_full.csv"  # Full metadata with families
     returns_matrix_path: Optional[str] = None  # Optional: for correlation-based clustering
     
     # Output paths
-    panel_parquet: str = r"C:\REPOSITORY\Models\cs_momentum_features.parquet"
-    universe_metadata_output: str = r"C:\REPOSITORY\Models\universe_metadata.csv"
-    results_csv: str = r"C:\REPOSITORY\Models\cs_momentum_results.csv"
-    plots_dir: str = r"C:\REPOSITORY\Models\plots"
+    panel_parquet: str = r"D:\REPOSITORY\Data\crosssecmom2\cs_momentum_features.parquet"
+    universe_metadata_output: str = r"D:\REPOSITORY\Data\crosssecmom2\universe_metadata.csv"
+    results_csv: str = r"D:\REPOSITORY\Data\crosssecmom2\cs_momentum_results.csv"
+    plots_dir: str = r"D:\REPOSITORY\Data\crosssecmom2\plots"
 
 
 @dataclass
