@@ -1,10 +1,7 @@
 """
 Panel Data Utilities for Cross-Sectional Research
 ==================================================
-Demonstrates powerful operations enabled by the panel structure that were
-difficult/impossible with wide format data.
-
-Operations include:
+Demonstrates operations enabled by the panel structure. Operations include:
 - Universe evolution tracking
 - Cross-sectional correlation analysis
 - Feature importance via IC (Information Coefficient)
