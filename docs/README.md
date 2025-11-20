@@ -10,11 +10,11 @@ This system uses a **panel data structure** optimized for cross-sectional moment
 - Efficient walk-forward window slicing
 - Built-in forward returns for evaluation
 
-# Refactored Cross-Sectional Momentum System
+# Cross-Sectional Momentum System
 
 ## Overview
 
-This refactored system implements a rigorous cross-sectional momentum research framework with:
+This system implements a rigorous cross-sectional momentum research framework with:
 - ✅ **No look-ahead bias**: All supervised operations (binning, feature selection, model training) use only training window data
 - ✅ **Proper time structure**: Explicit FEATURE_MAX_LAG_DAYS, TRAINING_WINDOW_DAYS, HOLDING_PERIOD_DAYS, STEP_DAYS
 - ✅ **Model-agnostic interface**: Works with any alpha model via train/score pattern
@@ -25,7 +25,7 @@ This refactored system implements a rigorous cross-sectional momentum research f
 ## File Structure
 
 ```
-refactored_system/
+crosssecmom2/
 ├── config.py                           # Configuration module
 ├── universe_metadata.py                # ETF families, duplicates, clusters, caps
 ├── alpha_models.py                     # Model interface with supervised binning
