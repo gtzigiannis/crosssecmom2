@@ -1,16 +1,14 @@
 """
-Cross-Sectional Momentum Feature Engineering (Refactored)
+Cross-Sectional Momentum Feature Engineering
 ==========================================================
-Generates panel data with raw features only - NO global binning.
 
 Key principles:
 1. Takes config object as input (no hard-coded paths/dates)
-2. Includes raw Close column (CRITICAL FIX)
-3. Computes ADV_63 for liquidity filtering (replaces VPT)
-4. NO global supervised binning (done per training window)
-5. NO cross-sectional transforms here (done in walk-forward)
-6. Forward returns at config.time.HOLDING_PERIOD_DAYS only
-7. NO FFT/wavelet features (removed as requested)
+2. Computes ADV_63 for liquidity filtering
+3. NO global supervised binning (done per training window)
+4. NO cross-sectional transforms here (done in walk-forward)
+5. Forward returns at config.time.HOLDING_PERIOD_DAYS only
+6. NO FFT/wavelet features
 
 Output: Panel with (Date, Ticker) MultiIndex containing:
 - Close (raw price)
