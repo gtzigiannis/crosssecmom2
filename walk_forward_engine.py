@@ -1,7 +1,7 @@
 """
 Walk-Forward Engine (Refactored)
 =================================
-Model-agnostic walk-forward backtesting engine with proper time structure.
+Model-agnostic walk-forward backtesting engine with discreet-windows time structure.
 
 Key design principles:
 1. Uses explicit FEATURE_MAX_LAG_DAYS, TRAINING_WINDOW_DAYS, HOLDING_PERIOD_DAYS, STEP_DAYS
