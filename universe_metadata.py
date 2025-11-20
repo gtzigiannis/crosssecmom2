@@ -4,7 +4,7 @@ Universe Metadata Module
 Handles ETF family classification, duplicate detection, theme clustering,
 and portfolio constraint parameters (cluster caps, per-ETF caps).
 
-This module implements the ETF labeling and clustering scaffold to:
+This module implements ETF labeling and clustering to:
 1. Assign each ETF to an economic family
 2. Identify and remove duplicate ETFs (same family, high correlation)
 3. Cluster ETFs into theme groups by correlation
