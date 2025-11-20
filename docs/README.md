@@ -16,11 +16,4 @@ This system uses a **panel data structure** optimized for cross-sectional moment
   - `Feature_ZScore`: Standardized value
   - `Feature_Quantile`: Decile bin (0-9)
 
-## Documentation
-
-For detailed documentation, please see the [docs](./docs) directory:
-- [Implementation Guide](./docs/IMPLEMENTATION_GUIDE.md)
-- [Quick Reference](./docs/QUICK_REFERENCE.md)
-- [Summary](./docs/SUMMARY.md)
-- [Repository Summary](./docs/repo_summary.md)
 
