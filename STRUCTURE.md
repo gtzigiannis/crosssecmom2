@@ -1,4 +1,4 @@
-## Files Created/Modified
+## Files Structure
 
 ### 1. ✅ config.py 
 **Purpose**: Centralized configuration module
