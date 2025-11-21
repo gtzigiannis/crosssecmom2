@@ -184,6 +184,22 @@ class FeatureConfig:
                 
                 # Higher moments
                 'Close_skew63', 'Close_kurt63',
+                
+                # NEW from crosssecmom: Drawdown features
+                'Close_DD20', 'Close_DD60',
+                
+                # NEW from crosssecmom: Shock features
+                'Close_Ret1dZ',
+                
+                # NEW from crosssecmom: Relative returns
+                'Rel5_vs_VT', 'Rel20_vs_VT', 'Rel60_vs_VT',
+                'Rel5_vs_Basket', 'Rel20_vs_Basket', 'Rel60_vs_Basket',
+                
+                # NEW from crosssecmom: Correlations
+                'Corr20_VT', 'Corr20_BNDW',
+                
+                # NEW from crosssecmom: Macro features (continuous only, exclude binary flags)
+                'vix_level', 'vix_z_1y', 'yc_slope', 'short_rate', 'credit_proxy_20',
             ]
 
 
@@ -191,7 +207,7 @@ class FeatureConfig:
 class ComputeConfig:
     """Computational parameters."""
     
-    n_jobs: int = 8                   # Parallel jobs for feature engineering
+    n_jobs: int = -1                  # Parallel jobs for feature engineering (-1 = all cores)
     verbose: bool = True              # Print progress messages
     parallelize_backtest: bool = False  # Parallelize walk-forward backtest
     
