@@ -134,7 +134,8 @@ def get_eligible_universe(
     panel_df: pd.DataFrame,
     universe_metadata: pd.DataFrame,
     t0: pd.Timestamp,
-    config: ResearchConfig
+    config: ResearchConfig,
+    verbose: bool = False
 ) -> pd.DataFrame:
     """
     Get eligible universe at date t0 after all filters.
@@ -149,6 +150,8 @@ def get_eligible_universe(
         Current date
     config : ResearchConfig
         Configuration
+    verbose : bool, default False
+        Whether to print diagnostic information
         
     Returns
     -------
@@ -330,7 +333,7 @@ def run_walk_forward_backtest(
         # 3. Get eligible universe at t0
         # =====================================================================
         eligible_universe = get_eligible_universe(
-            panel_df, universe_metadata, t0, config
+            panel_df, universe_metadata, t0, config, verbose
         )
         
         if len(eligible_universe) < 10:
