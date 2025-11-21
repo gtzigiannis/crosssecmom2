@@ -137,22 +137,23 @@ class FeatureConfig:
     def __post_init__(self):
         if self.base_features is None:
             # Default base feature list (no binning yet)
+            # FIXED: Match actual column names from feature_engineering.py
             self.base_features = [
                 # Returns at multiple horizons
                 'Close%-21', 'Close%-63', 'Close%-126', 'Close%-252',
                 
-                # Momentum
-                'Mom21', 'Mom42', 'Mom63',
+                # Momentum (Close_Mom*)
+                'Close_Mom21', 'Close_Mom42', 'Close_Mom63',
                 
-                # Volatility
-                'std21', 'std63', 'ATR14',
+                # Volatility (Close_std*, Close_ATR*)
+                'Close_std21', 'Close_std63', 'Close_ATR14',
                 
-                # Trend indicators
-                'MA21', 'MA63', 'EMA21', 'EMA63',
+                # Trend indicators (Close_MA*, Close_EMA*)
+                'Close_MA21', 'Close_MA63', 'Close_EMA21', 'Close_EMA63',
                 
-                # Oscillators
-                'RSI14', 'RSI21',
-                'MACD', 'MACD_Signl', 'MACD_Histo',
+                # Oscillators (Close_RSI*, Close_MACD*)
+                'Close_RSI14', 'Close_RSI21',
+                'Close_MACD', 'Close_MACD_Signl', 'Close_MACD_Histo',
                 
                 # Liquidity
                 'ADV_63', 'ADV_63_Rank',
@@ -160,11 +161,12 @@ class FeatureConfig:
         
         if self.binning_candidates is None:
             # Default binning candidates (subset of base features)
+            # FIXED: Match actual column names from feature_engineering.py
             self.binning_candidates = [
                 'Close%-21', 'Close%-63', 'Close%-126', 'Close%-252',
-                'Mom21', 'Mom63',
-                'std21', 'std63',
-                'RSI14', 'RSI21',
+                'Close_Mom21', 'Close_Mom63',
+                'Close_std21', 'Close_std63',
+                'Close_RSI14', 'Close_RSI21',
             ]
 
 
