@@ -16,7 +16,7 @@ from pathlib import Path
 
 from config import get_default_config, ResearchConfig
 from universe_metadata import build_universe_metadata
-from feature_engineering_refactored import run_feature_engineering
+from Quant.strategies.crosssecmom2.feature_engineering import run_feature_engineering
 from walk_forward_engine import run_walk_forward_backtest, analyze_performance
 
 

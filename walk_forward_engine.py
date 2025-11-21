@@ -165,7 +165,17 @@ def get_eligible_universe(
     filtered = apply_universe_filters(cross_section, universe_metadata, config)
     
     # Check history requirement
+    # WARNING: This is a STRICT requirement. By t0, each ticker must have
+    # at least FEATURE_MAX_LAG_DAYS + TRAINING_WINDOW_DAYS of historical data.
+    # This ensures we have enough data for both feature calculation and model training.
+    # 
+    # Future enhancement: Could implement a more flexible approach that allows
+    # tickers to enter the universe as soon as they meet minimum requirements,
+    # rather than requiring full history from the start.
     required_history = config.time.FEATURE_MAX_LAG_DAYS + config.time.TRAINING_WINDOW_DAYS
+    
+    if verbose:
+        print(f"[universe] History requirement: {required_history} days (FEATURE_MAX_LAG + TRAINING_WINDOW)")
     
     sufficient_history = []
     for ticker in filtered.index:
@@ -180,7 +190,7 @@ def run_walk_forward_backtest(
     universe_metadata: pd.DataFrame,
     config: ResearchConfig,
     model_type: str = 'supervised_binned',
-    portfolio_method: str = 'cvxpy',
+    portfolio_method: str = 'simple',  # Default to 'simple' for robustness
     verbose: bool = True
 ) -> pd.DataFrame:
     """
@@ -235,6 +245,18 @@ def run_walk_forward_backtest(
         print(f"Holding period: {config.time.HOLDING_PERIOD_DAYS} days")
         print(f"Step size: {config.time.STEP_DAYS} days")
         print(f"Feature max lag: {config.time.FEATURE_MAX_LAG_DAYS} days")
+        print(f"Transaction costs: {config.portfolio.total_cost_bps_per_side:.1f} bps per side")
+        print(f"Borrow cost: {config.portfolio.borrow_cost:.1%} annualized")
+        print(f"Random state: {config.features.random_state}")
+    
+    # Validate portfolio method
+    from portfolio_construction import CVXPY_AVAILABLE
+    if portfolio_method == 'cvxpy' and not CVXPY_AVAILABLE:
+        if verbose:
+            print(f"[warn] cvxpy not available, falling back to 'simple' method")
+        portfolio_method = 'simple'
+    elif portfolio_method not in ['cvxpy', 'simple']:
+        raise ValueError(f"portfolio_method must be 'cvxpy' or 'simple', got '{portfolio_method}'")
     
     # Get unique dates
     dates = panel_df.index.get_level_values('Date').unique().sort_values()
@@ -254,6 +276,15 @@ def run_walk_forward_backtest(
         print(f"Date range: {current_dates[0].date()} to {current_dates[-1].date()}")
     
     results = []
+    
+    # Track previous weights for turnover calculation
+    prev_long_weights = None
+    prev_short_weights = None
+    
+    # Diagnostic tracking
+    ic_history = []  # Store IC vectors for each window
+    feature_selection_history = []  # Track which features were selected
+    universe_size_history = []  # Track universe size after each filter
     
     for i, t0 in enumerate(current_dates):
         if verbose:
@@ -342,10 +373,21 @@ def run_walk_forward_backtest(
         if verbose:
             print(f"[portfolio] Constructing portfolio with caps...")
         
+        # CRITICAL: Filter universe_metadata to only eligible tickers
+        # This ensures portfolio construction only considers eligible universe
+        if 'ticker' in universe_metadata.columns:
+            eligible_metadata = universe_metadata[
+                universe_metadata['ticker'].isin(eligible_universe.index)
+            ].copy()
+        else:
+            eligible_metadata = universe_metadata[
+                universe_metadata.index.isin(eligible_universe.index)
+            ].copy()
+        
         try:
             long_weights, short_weights, portfolio_stats = construct_portfolio(
                 scores=scores,
-                universe_metadata=universe_metadata,
+                universe_metadata=eligible_metadata,
                 config=config,
                 method=portfolio_method
             )
@@ -375,7 +417,9 @@ def run_walk_forward_backtest(
                 t0=t0,
                 long_weights=long_weights,
                 short_weights=short_weights,
-                config=config
+                config=config,
+                prev_long_weights=prev_long_weights,
+                prev_short_weights=prev_short_weights
             )
         except Exception as e:
             if verbose:
@@ -386,11 +430,20 @@ def run_walk_forward_backtest(
         performance.update(portfolio_stats)
         
         if verbose:
-            print(f"[result] Long: {performance['long_ret']:.2f}%, "
-                  f"Short: {performance['short_ret']:.2f}%, "
-                  f"L/S: {performance['ls_return']:.2f}%")
+            ret_str = f"[result] Long: {performance['long_ret']:.2%}, "
+            ret_str += f"Short: {performance['short_ret']:.2%}, "
+            ret_str += f"L/S: {performance['ls_return']:.2%}"
+            if performance.get('turnover', 0) > 0:
+                ret_str += f", Turnover: {performance['turnover']:.2%}"
+            if performance.get('transaction_cost', 0) > 0:
+                ret_str += f", TxnCost: {performance['transaction_cost']:.4%}"
+            print(ret_str)
         
         results.append(performance)
+        
+        # Update previous weights for next iteration
+        prev_long_weights = long_weights.copy()
+        prev_short_weights = short_weights.copy()
     
     # =========================================================================
     # Convert results to DataFrame

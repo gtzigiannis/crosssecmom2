@@ -218,7 +218,8 @@ def fit_supervised_bins(
     target_values: pd.Series,
     max_depth: int = 3,
     min_samples_leaf: int = 100,
-    n_bins: int = 10
+    n_bins: int = 10,
+    **kwargs
 ) -> np.ndarray:
     """
     Fit supervised bins using decision tree regressor.
@@ -254,12 +255,15 @@ def fit_supervised_bins(
         # Insufficient data, return single bin
         return np.array([-np.inf, np.inf])
     
+    # Get random_state from kwargs if provided
+    random_state = kwargs.get('random_state', None)
+    
     # Fit decision tree
     tree = DecisionTreeRegressor(
         max_depth=max_depth,
         min_samples_leaf=min_samples_leaf,
         max_leaf_nodes=n_bins,
-        random_state=42
+        random_state=random_state
     )
     
     try:
@@ -384,6 +388,27 @@ def train_alpha_model(
         warnings.warn(f"No training data in [{t_train_start}, {t_train_end}]")
         return MomentumRankModel(feature='Close%-63')
     
+    # ===== CRITICAL: Restrict to core universe (eligible tickers) =====
+    # Only train on tickers that are in the core universe after duplicate removal
+    if 'ticker' in universe_metadata.columns:
+        metadata_idx = universe_metadata.set_index('ticker')
+    else:
+        metadata_idx = universe_metadata
+    
+    if 'in_core_after_duplicates' in metadata_idx.columns:
+        core_tickers = metadata_idx[
+            metadata_idx['in_core_after_duplicates'] == True
+        ].index
+        
+        # Filter training data to core tickers only
+        tickers_in_train = train_data.index.get_level_values('Ticker')
+        core_mask = tickers_in_train.isin(core_tickers)
+        train_data = train_data[core_mask].copy()
+        
+        if len(train_data) == 0:
+            warnings.warn(f"No core ticker data in training window")
+            return MomentumRankModel(feature='Close%-63')
+    
     # Target column
     target_col = f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}'
     if target_col not in train_data.columns:
@@ -405,7 +430,8 @@ def train_alpha_model(
             train_data[target_col],
             max_depth=config.features.bin_max_depth,
             min_samples_leaf=config.features.bin_min_samples_leaf,
-            n_bins=config.features.n_bins
+            n_bins=config.features.n_bins,
+            random_state=config.features.random_state
         )
         
         binning_dict[feat] = boundaries

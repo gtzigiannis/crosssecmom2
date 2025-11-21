@@ -33,6 +33,7 @@ def construct_portfolio_simple(
     Simple portfolio construction: top/bottom quantiles with equal weights.
     
     Optionally enforces caps via simple scaling (not optimal, but fast).
+    Supports long_only and short_only modes.
     
     Parameters
     ----------
@@ -66,9 +67,24 @@ def construct_portfolio_simple(
     long_tickers = sorted_scores.head(n_long).index
     short_tickers = sorted_scores.tail(n_short).index
     
-    # Equal weights within each side
-    long_weights = pd.Series(1.0 / n_long, index=long_tickers)
-    short_weights = pd.Series(-1.0 / n_short, index=short_tickers)
+    # Equal weights within each side (respecting long_only/short_only flags)
+    # IMPORTANT: Short weights are scaled by margin requirement
+    # With 50% margin, you can only short up to 50% of capital (not 100%)
+    short_leverage = config.portfolio.margin
+    
+    if config.portfolio.short_only:
+        # Short only mode: no long positions
+        long_weights = pd.Series(dtype=float)
+        # Scale by margin: 50% margin means max 50% short exposure
+        short_weights = pd.Series(-short_leverage / n_short, index=short_tickers)
+    elif config.portfolio.long_only:
+        # Long only mode: no short positions
+        long_weights = pd.Series(1.0 / n_long, index=long_tickers)
+        short_weights = pd.Series(dtype=float)
+    else:
+        # Standard long/short: 100% long, margin-limited short
+        long_weights = pd.Series(1.0 / n_long, index=long_tickers)
+        short_weights = pd.Series(-short_leverage / n_short, index=short_tickers)
     
     if not enforce_caps:
         return long_weights, short_weights
@@ -146,7 +162,10 @@ def construct_portfolio_cvxpy(
     short_tickers = sorted_scores.tail(n_short).index.tolist()
     
     # ===== Long portfolio =====
-    if len(long_tickers) > 0:
+    if config.portfolio.short_only:
+        # Short only mode: skip long portfolio
+        long_weights = pd.Series(dtype=float)
+    elif len(long_tickers) > 0:
         long_weights = _optimize_one_side(
             tickers=long_tickers,
             scores=scores[long_tickers],
@@ -159,12 +178,19 @@ def construct_portfolio_cvxpy(
         long_weights = pd.Series(dtype=float)
     
     # ===== Short portfolio =====
-    if len(short_tickers) > 0:
+    # Target gross exposure scaled by margin requirement
+    # With 50% margin, can only short up to 50% of capital
+    short_target_gross = config.portfolio.margin
+    
+    if config.portfolio.long_only:
+        # Long only mode: skip short portfolio
+        short_weights = pd.Series(dtype=float)
+    elif len(short_tickers) > 0:
         short_weights = _optimize_one_side(
             tickers=short_tickers,
             scores=scores[short_tickers],
             metadata=metadata_subset.loc[short_tickers],
-            target_gross=1.0,
+            target_gross=short_target_gross,
             side='short',
             config=config
         )
@@ -335,7 +361,9 @@ def evaluate_portfolio_return(
     t0: pd.Timestamp,
     long_weights: pd.Series,
     short_weights: pd.Series,
-    config
+    config,
+    prev_long_weights: Optional[pd.Series] = None,
+    prev_short_weights: Optional[pd.Series] = None
 ) -> Dict:
     """
     Evaluate portfolio return using forward returns.
@@ -386,13 +414,79 @@ def evaluate_portfolio_return(
     else:
         short_ret = 0.0
     
-    # Total return (long + short, where short_weights are negative)
-    ls_return = long_ret + short_ret
+    # Calculate cash return for uninvested capital
+    # Gross exposures
+    gross_long = long_weights.sum() if len(long_weights) > 0 else 0.0
+    gross_short = abs(short_weights.sum()) if len(short_weights) > 0 else 0.0
+    
+    # Cash position (uninvested capital)
+    # For long_only: cash = 1.0 - gross_long
+    # For short_only: cash = 1.0 - gross_short
+    # For long/short: cash = 0 (fully invested on both sides)
+    cash_weight = max(0.0, 1.0 - gross_long - gross_short)
+    
+    # Convert annual cash rate to holding period return
+    days_per_year = 252  # Trading days
+    holding_period_return = config.portfolio.cash_rate * (config.time.HOLDING_PERIOD_DAYS / days_per_year)
+    cash_ret = cash_weight * holding_period_return
+    
+    # ===== Calculate turnover and transaction costs =====
+    turnover_long = 0.0
+    turnover_short = 0.0
+    
+    if prev_long_weights is not None:
+        # Align previous and current weights
+        all_tickers = long_weights.index.union(prev_long_weights.index)
+        curr_w = long_weights.reindex(all_tickers, fill_value=0.0)
+        prev_w = prev_long_weights.reindex(all_tickers, fill_value=0.0)
+        turnover_long = 0.5 * (curr_w - prev_w).abs().sum()
+    
+    if prev_short_weights is not None:
+        # Align previous and current weights (shorts are negative)
+        all_tickers = short_weights.index.union(prev_short_weights.index)
+        curr_w = short_weights.reindex(all_tickers, fill_value=0.0)
+        prev_w = prev_short_weights.reindex(all_tickers, fill_value=0.0)
+        turnover_short = 0.5 * (curr_w - prev_w).abs().sum()
+    
+    total_turnover = turnover_long + turnover_short
+    
+    # Transaction costs: cost_bps * turnover / 10000
+    # Costs are per side, and turnover already captures one-way trading
+    cost_bps = config.portfolio.total_cost_bps_per_side
+    transaction_cost = cost_bps * total_turnover / 10000.0
+    
+    # ===== Calculate borrowing costs for shorts =====
+    # When you short, the broker lends you the securities to sell
+    # You pay interest on the FULL notional value borrowed (100% of short position)
+    # The margin (e.g., 50%) is what YOU put up as collateral
+    # 
+    # Example: To short $100k of stock with 50% margin:
+    #   - You post $50k margin (your capital)
+    #   - Broker lends you $100k worth of securities
+    #   - You pay borrow_cost on the full $100k
+    # 
+    # Cost = borrow_cost * gross_short * (holding_days / 365)
+    # NOTE: We do NOT multiply by margin here - you pay on the full borrowed amount
+    borrow_cost_ret = 0.0
+    if gross_short > 0:
+        borrow_cost_ret = (config.portfolio.borrow_cost * 
+                          gross_short * 
+                          (config.time.HOLDING_PERIOD_DAYS / 365.0))
+    
+    # Total return (long + short + cash - transaction costs - borrow costs)
+    ls_return = long_ret + short_ret + cash_ret - transaction_cost - borrow_cost_ret
     
     return {
         'date': t0,
         'long_ret': long_ret,
         'short_ret': short_ret,
+        'cash_ret': cash_ret,
+        'cash_weight': cash_weight,
+        'turnover': total_turnover,
+        'turnover_long': turnover_long,
+        'turnover_short': turnover_short,
+        'transaction_cost': transaction_cost,
+        'borrow_cost': borrow_cost_ret,
         'ls_return': ls_return,
         'n_long': len(long_weights),
         'n_short': len(short_weights),

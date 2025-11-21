@@ -15,15 +15,15 @@ class PathConfig:
     """File paths for data inputs and outputs."""
     
     # Input paths
-    universe_csv: str = r"C:\REPOSITORY\Models\etf_universe_names.csv"
-    universe_metadata_csv: str = r"C:\REPOSITORY\Models\etf_universe_full.csv"  # Full metadata with families
+    universe_csv: str = r"D:\REPOSITORY\Data\crosssecmom2\etf_universe_names.csv"
+    universe_metadata_csv: str = r"D:\REPOSITORY\Data\crosssecmom2\etf_universe_full.csv"  # Full metadata with families
     returns_matrix_path: Optional[str] = None  # Optional: for correlation-based clustering
     
     # Output paths
-    panel_parquet: str = r"C:\REPOSITORY\Models\cs_momentum_features.parquet"
-    universe_metadata_output: str = r"C:\REPOSITORY\Models\universe_metadata.csv"
-    results_csv: str = r"C:\REPOSITORY\Models\cs_momentum_results.csv"
-    plots_dir: str = r"C:\REPOSITORY\Models\plots"
+    panel_parquet: str = r"D:\REPOSITORY\Data\crosssecmom2\cs_momentum_features.parquet"
+    universe_metadata_output: str = r"D:\REPOSITORY\Data\crosssecmom2\universe_metadata.csv"
+    results_csv: str = r"D:\REPOSITORY\Data\crosssecmom2\cs_momentum_results.csv"
+    plots_dir: str = r"D:\REPOSITORY\Data\crosssecmom2\plots"
 
 
 @dataclass
@@ -73,9 +73,29 @@ class PortfolioConfig:
     short_quantile: float = 0.1  # Bottom 10% for short portfolio
     leverage: float = 1.0         # Portfolio leverage (1.0 = 100% long + 100% short)
     
+    # Portfolio mode
+    long_only: bool = False      # If True, only construct long positions (cash otherwise)
+    short_only: bool = False     # If True, only construct short positions (cash otherwise)
+    cash_rate: float = 0.045     # Annual interest rate on cash positions (default 4.5%)
+    
+    # Transaction costs
+    commission_bps: float = 1.0  # Commission in basis points per side
+    slippage_bps: float = 2.0    # Slippage in basis points per side
+    
+    # Borrowing costs for shorting
+    borrow_cost: float = 0.05    # Annual borrowing cost for shorts (5% on full notional)
+    margin: float = 0.50         # Margin requirement: max short exposure as fraction of capital
+                                 # 50% margin = can short up to 50% of capital
+                                 # You pay borrow_cost on FULL short value (not margin-adjusted)
+    
     # Risk limits (default caps)
     default_cluster_cap: float = 0.10  # 10% max per theme cluster
     default_per_etf_cap: float = 0.05  # 5% max per ETF
+    
+    @property
+    def total_cost_bps_per_side(self) -> float:
+        """Total transaction cost per side in basis points."""
+        return self.commission_bps + self.slippage_bps
     
     # High-risk family caps (lower limits)
     high_risk_cluster_cap: float = 0.07  # 7% for risky themes
@@ -110,6 +130,9 @@ class FeatureConfig:
     bin_max_depth: int = 3            # Max depth for decision tree binning
     bin_min_samples_leaf: int = 100   # Min samples per leaf
     n_bins: int = 10                  # Target number of bins
+    
+    # Reproducibility
+    random_state: Optional[int] = 42  # Random seed for reproducible results
     
     def __post_init__(self):
         if self.base_features is None:
@@ -151,6 +174,11 @@ class ComputeConfig:
     
     n_jobs: int = 8                   # Parallel jobs for feature engineering
     verbose: bool = True              # Print progress messages
+    parallelize_backtest: bool = False  # Parallelize walk-forward backtest
+    
+    # Persistence
+    save_intermediate: bool = True    # Save intermediate objects
+    ic_output_path: Optional[str] = None  # Path for IC vectors (defaults to plots_dir/ic_vectors.csv)
 
 
 @dataclass
@@ -193,6 +221,13 @@ class ResearchConfig:
         assert 0 < self.portfolio.long_quantile < 1, "long_quantile must be in (0, 1)"
         assert 0 < self.portfolio.short_quantile < 1, "short_quantile must be in (0, 1)"
         assert self.portfolio.leverage >= 0, "leverage must be non-negative"
+        assert not (self.portfolio.long_only and self.portfolio.short_only), \
+            "Cannot set both long_only and short_only to True"
+        assert self.portfolio.cash_rate >= 0, "cash_rate must be non-negative"
+        assert self.portfolio.commission_bps >= 0, "commission_bps must be non-negative"
+        assert self.portfolio.slippage_bps >= 0, "slippage_bps must be non-negative"
+        assert self.portfolio.borrow_cost >= 0, "borrow_cost must be non-negative"
+        assert 0 < self.portfolio.margin <= 1, "margin must be in (0, 1]"
         
         # Feature config
         assert self.features.ic_threshold >= 0, "ic_threshold must be non-negative"
