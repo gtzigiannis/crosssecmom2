@@ -1,7 +1,7 @@
 # Cross-Sectional Momentum Strategy (crosssecmom2)
 
 > **Last Updated**: November 21, 2025  
-> **Status**: Production-Ready with Full Cost Modeling  
+> **Status**: Production-Ready with Full Cost Modeling & Regime Switching  
 > **Strategy Type**: Cross-Sectional Momentum on 116 ETFs (2015-2025)
 
 ---
@@ -14,6 +14,7 @@
 - [Configuration](#configuration)
 - [Cost Modeling](#cost-modeling)
 - [Portfolio Construction](#portfolio-construction)
+- [Regime-Based Switching](#regime-based-switching)
 - [Walk-Forward Backtesting](#walk-forward-backtesting)
 - [Testing](#testing)
 - [Performance](#performance)
@@ -38,7 +39,8 @@
 ✅ **Realistic Cost Modeling**: Transaction costs (commission + slippage) and borrowing costs  
 ✅ **Margin-Constrained Shorts**: Proper modeling of leverage limits (50% margin = 50% max short)  
 ✅ **Universe Management**: Handles ETF families, duplicates, theme clustering, caps  
-✅ **Multiple Modes**: Standard long/short, long-only, short-only  
+✅ **Multiple Modes**: Standard long/short, long-only, short-only, regime-based switching  
+✅ **Regime Awareness**: Optional market regime detection for adaptive portfolio construction  
 ✅ **Reproducible**: Fixed random state for deterministic results  
 ✅ **Production-Ready**: Comprehensive testing, diagnostics, and validation
 
@@ -171,6 +173,7 @@ This ensures bins are "out-of-sample" relative to scoring date.
 ```
 crosssecmom2/
 ├── config.py                           # All configuration parameters
+├── regime.py                           # Market regime classification
 ├── universe_metadata.py                # ETF families, duplicates, clusters, caps
 ├── feature_engineering_refactored.py   # Panel generation (raw features)
 ├── alpha_models.py                     # Model training with supervised binning
@@ -179,6 +182,7 @@ crosssecmom2/
 ├── main.py                            # Entry point
 ├── TEST_FIXES.py                      # Tests for basic correctness
 ├── TEST_ADVANCED_FIXES.py            # Tests for costs and advanced features
+├── test_regime.py                     # Tests for regime system
 └── README.md                          # This file
 ```
 
@@ -249,6 +253,16 @@ config.portfolio.cash_rate = 0.045       # 4.5% annual cash rate
 config.universe.min_adv_percentile = 10  # Bottom 10% excluded by liquidity
 config.universe.dup_corr_threshold = 0.99
 config.universe.max_within_cluster_corr = 0.85
+
+# Regime parameters
+config.regime.use_regime = False         # Enable/disable regime switching
+config.regime.market_ticker = 'SPY'      # Ticker for regime detection
+config.regime.ma_window = 200            # Moving average window
+config.regime.lookback_return_days = 63  # Return calculation period
+config.regime.bull_ret_threshold = 0.02  # +2% for bull regime
+config.regime.bear_ret_threshold = -0.02 # -2% for bear regime
+config.regime.use_hysteresis = False     # Prevent rapid switching
+config.regime.neutral_buffer_days = 21   # Hysteresis buffer
 
 # Compute parameters
 config.compute.verbose = True
@@ -440,6 +454,205 @@ config.portfolio.short_only = True
 - Long positions skipped
 - Transaction cost = cost_bps × short_turnover
 - Borrowing cost = borrow_rate × gross_short × time
+
+---
+
+## Regime-Based Switching
+
+### Overview
+
+The regime system enables **adaptive portfolio construction** based on market conditions. The alpha model remains agnostic to regime—it simply scores stocks. The regime determines whether to go long, short, or stay in cash.
+
+**Key Principle**: Regime at t0 uses data up to t0-1 (no look-ahead bias)
+
+### Regime Classification
+
+**Three Regimes**:
+1. **Bull**: Strong uptrend → Long-only portfolio
+2. **Bear**: Strong downtrend → Short-only portfolio  
+3. **Range**: Sideways/neutral → Cash (no positions)
+
+**Rules**:
+- **Bull**: Close > MA200 AND 63-day return > +2%
+- **Bear**: Close < MA200 AND 63-day return < -2%
+- **Range**: Everything else
+
+**Market Ticker**: Default is SPY, configurable to any ticker in your universe
+
+### Configuration
+
+```python
+from config import ResearchConfig, RegimeConfig
+
+config = ResearchConfig.default()
+config.regime = RegimeConfig(
+    use_regime=True,           # Enable regime switching
+    market_ticker='SPY',       # Use SPY for regime detection
+    ma_window=200,             # 200-day moving average
+    lookback_return_days=63,   # 3-month return
+    bull_ret_threshold=0.02,   # +2% for bull
+    bear_ret_threshold=-0.02,  # -2% for bear
+    use_hysteresis=True,       # Prevent rapid switching
+    neutral_buffer_days=21     # 21-day buffer before regime change
+)
+```
+
+### How It Works
+
+**Before Backtest Loop**:
+```python
+# Compute regime series once (shifted by 1 day for no look-ahead)
+regime_series = compute_regime_series(panel_df, config.regime)
+# Returns: pd.Series with 'bull', 'bear', 'range' indexed by date
+```
+
+**Inside Backtest Loop** (at each rebalance t0):
+```python
+# 1. Get current regime (already shifted, so uses data up to t0-1)
+current_regime = regime_series.get(t0, 'range')  # Default to range
+
+# 2. Map regime to portfolio mode
+mode = get_portfolio_mode_for_regime(current_regime)
+# bull → 'long_only'
+# bear → 'short_only'
+# range → 'cash'
+
+# 3. Construct portfolio with mode
+long_weights, short_weights = construct_portfolio(
+    scores=scores,
+    universe_metadata=metadata,
+    config=config,
+    mode=mode  # ← Explicit mode parameter
+)
+```
+
+### Regime → Mode Mappings
+
+| Regime | Portfolio Mode | Behavior |
+|--------|---------------|----------|
+| bull | `'long_only'` | Only long positions, skip shorts |
+| bear | `'short_only'` | Only short positions (limited by margin) |
+| range | `'cash'` | No positions, stay in cash |
+| (disabled) | `'ls'` | Standard long/short (default) |
+
+### Example Console Output
+
+```
+[regime] Computing regime series using SPY
+[regime] MA window: 200, Lookback: 63
+[regime] Computed 1200 regime values
+[regime]   Bull: 450 days (37.5%)
+[regime]   Bear: 300 days (25.0%)
+[regime]   Range: 450 days (37.5%)
+
+[2020-01-15] Rebalance date
+[regime] Current regime: bull → mode: long_only
+[portfolio] Long: 20 positions, gross: 100.00%
+[portfolio] Short: 0 positions, gross: 0.00%
+
+[2020-02-15] Rebalance date
+[regime] Current regime: bear → mode: short_only
+[portfolio] Long: 0 positions, gross: 0.00%
+[portfolio] Short: 15 positions, gross: 50.00%  # Limited by margin
+
+[2020-03-15] Rebalance date
+[regime] Current regime: range → mode: cash
+[portfolio] Long: 0 positions, gross: 0.00%
+[portfolio] Short: 0 positions, gross: 0.00%
+```
+
+### Design Decisions
+
+**Why Mode Parameter?**
+- Clean separation: regime logic doesn't mutate config flags
+- Explicit and testable
+- Mode parameter takes priority over config.portfolio.long_only/short_only
+
+**Why Keep Model Agnostic?**
+- Alpha model predicts which stocks outperform regardless of market direction
+- Regime only affects how we express the view (long, short, or cash)
+- Cleaner architecture and easier to test
+
+**Why 1-Day Shift?**
+- Regime classification uses current price data
+- Shifting by 1 day ensures regime at t0 uses data from [start, t0-1]
+- No look-ahead bias ✓
+
+### Optional Hysteresis
+
+**Problem**: Regime can switch rapidly, causing excessive transactions
+
+**Solution**: Hysteresis requires N consecutive days in new regime before switching
+
+```python
+config.regime.use_hysteresis = True
+config.regime.neutral_buffer_days = 21  # Require 21 days before switching
+```
+
+**Effect**: Smooths regime transitions, reduces false signals
+
+### Testing
+
+**File**: `test_regime.py`
+
+```bash
+python test_regime.py
+```
+
+**Tests**:
+1. ✅ Regime classification on synthetic data (bull/bear/range)
+2. ✅ Portfolio mode mappings correct
+3. ✅ No look-ahead bias (1-day shift verified)
+4. ✅ Integration with configuration system
+
+**Test Output**:
+```
+TEST: Regime Classification
+============================
+Regime distribution:
+  range: 1128 (77.2%)
+  bull: 170 (11.6%)
+  bear: 163 (11.2%)
+
+TEST: Portfolio Mode Integration
+================================
+✓ Bull market should go long only
+✓ Bear market should go short only
+✓ Range market should stay in cash
+✓ Unknown regime should default to long/short
+
+ALL TESTS PASSED ✓
+```
+
+### Disabling Regime Switching
+
+```python
+# Option 1: Disable in config
+config.regime.use_regime = False
+
+# Option 2: Override at portfolio construction
+long_weights, short_weights = construct_portfolio(
+    scores=scores,
+    universe_metadata=metadata,
+    config=config,
+    mode='ls'  # Force standard long/short
+)
+```
+
+### Performance Considerations
+
+- **Regime computation**: O(n_dates) - single pass, done once before backtest
+- **Mode lookup**: O(1) - simple dictionary lookup per rebalance
+- **No overhead**: When `use_regime=False`
+
+### Future Enhancements
+
+Possible extensions:
+- Multiple market indicators (SPY + VIX + bond yields)
+- Machine learning regime classification
+- Dynamic thresholds based on volatility
+- Partial exposure scaling (e.g., 50% long in weak bull)
+- Regime transition detection for gradual position changes
 
 ---
 
@@ -653,7 +866,7 @@ stats = analyze_performance(results_df, config)
 | Per-period model training | 1-2 sec | 300 MB |
 | Per-period portfolio construction | <1 sec | 50 MB |
 
-*Azure Standard_DS5_v2 (16 cores, 128 GB RAM, Premium SSD) - Estimated based on code complexity*
+*Azure Standard_DS5_v2 (16 cores, > 16 GB RAM, Gen4+ SSD) - Estimated based on code complexity*
 
 ---
 
@@ -897,8 +1110,55 @@ python TEST_ADVANCED_FIXES.py  # See test_margin_limits_short_exposure()
 
 - ✅ **TEST_FIXES.py**: 4 tests for basic correctness
 - ✅ **TEST_ADVANCED_FIXES.py**: 9 tests for advanced features
+- ✅ **test_regime.py**: Regime classification and mode mapping tests
 - ✅ All tests passing
-- ✅ Comprehensive validation of costs, margin, reproducibility
+- ✅ Comprehensive validation of costs, margin, reproducibility, regime switching
+
+### Regime-Based Portfolio Switching (Latest)
+
+9. ✅ **Market Regime Classification**
+   - Module: `regime.py` with regime detection logic
+   - Classifies market into bull/bear/range based on MA200 + returns
+   - No look-ahead bias: regime at t0 uses data up to t0-1 (1-day shift)
+   - Files: `regime.py` (new)
+
+10. ✅ **Regime Configuration**
+    - Added `RegimeConfig` dataclass with 8 parameters
+    - Integrated into `ResearchConfig`
+    - Parameters: market_ticker, ma_window, return_thresholds, hysteresis
+    - Files: `config.py`
+
+11. ✅ **Portfolio Mode Parameter**
+    - Added explicit `mode` parameter to portfolio construction
+    - Modes: 'ls' (standard), 'long_only', 'short_only', 'cash'
+    - Mode takes priority over config flags (clean separation)
+    - Files: `portfolio_construction.py` (3 functions updated)
+
+12. ✅ **Walk-Forward Integration**
+    - Compute regime series once before backtest loop
+    - Determine mode at each rebalance based on current regime
+    - Pass mode to portfolio construction
+    - Files: `walk_forward_engine.py`
+
+13. ✅ **Regime Testing**
+    - Test file: `test_regime.py`
+    - Verifies classification on synthetic data
+    - Validates mode mappings
+    - Confirms no look-ahead bias
+    - All tests passing ✓
+
+**Regime Mappings**:
+- Bull market → Long-only portfolio
+- Bear market → Short-only portfolio  
+- Range market → Cash (no positions)
+- Unknown/disabled → Standard long/short
+
+**Key Benefits**:
+- Adaptive to market conditions
+- Model stays agnostic (clean architecture)
+- No look-ahead bias (1-day shift)
+- Optional hysteresis prevents rapid switching
+- Configurable thresholds and parameters
 
 ---
 

@@ -27,13 +27,14 @@ def construct_portfolio_simple(
     scores: pd.Series,
     universe_metadata: pd.DataFrame,
     config,
-    enforce_caps: bool = False
+    enforce_caps: bool = False,
+    mode: str = 'ls'
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Simple portfolio construction: top/bottom quantiles with equal weights.
     
     Optionally enforces caps via simple scaling (not optimal, but fast).
-    Supports long_only and short_only modes.
+    Supports multiple portfolio modes via mode parameter.
     
     Parameters
     ----------
@@ -45,12 +46,22 @@ def construct_portfolio_simple(
         Configuration object
     enforce_caps : bool
         If True, scale weights to respect caps
+    mode : str, default 'ls'
+        Portfolio mode:
+        - 'ls': Standard long/short (uses config.portfolio settings)
+        - 'long_only': Only long positions
+        - 'short_only': Only short positions
+        - 'cash': No positions (returns empty Series for both sides)
         
     Returns
     -------
     tuple of (pd.Series, pd.Series)
         (long_weights, short_weights) indexed by ticker
     """
+    # Handle cash mode (no positions)
+    if mode == 'cash':
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    
     # Filter scores to valid tickers
     valid_tickers = scores.dropna().index
     
@@ -67,26 +78,46 @@ def construct_portfolio_simple(
     long_tickers = sorted_scores.head(n_long).index
     short_tickers = sorted_scores.tail(n_short).index
     
-    # Equal weights within each side (respecting long_only/short_only flags)
+    # Equal weights within each side
     # IMPORTANT: 
     # - Long positions scaled by long_leverage (typically 1.0 = 100% of capital)
     # - Short positions scaled by margin requirement (e.g., 50% margin = max 50% short)
     long_leverage = config.portfolio.long_leverage
     short_leverage = config.portfolio.margin
     
-    if config.portfolio.short_only:
-        # Short only mode: no long positions
-        long_weights = pd.Series(dtype=float)
-        # Scale by margin: 50% margin means max 50% short exposure
-        short_weights = pd.Series(-short_leverage / n_short, index=short_tickers)
-    elif config.portfolio.long_only:
-        # Long only mode: no short positions
-        long_weights = pd.Series(long_leverage / n_long, index=long_tickers)
-        short_weights = pd.Series(dtype=float)
+    # Determine which sides to build based on mode
+    # Priority: explicit mode parameter > config.portfolio flags
+    if mode == 'short_only':
+        build_long = False
+        build_short = True
+    elif mode == 'long_only':
+        build_long = True
+        build_short = False
+    elif mode == 'ls':
+        # Use config flags
+        if config.portfolio.short_only:
+            build_long = False
+            build_short = True
+        elif config.portfolio.long_only:
+            build_long = True
+            build_short = False
+        else:
+            build_long = True
+            build_short = True
     else:
-        # Standard long/short: long_leverage on long side, margin-limited short
+        raise ValueError(f"Invalid mode: {mode}. Must be 'ls', 'long_only', 'short_only', or 'cash'")
+    
+    # Build long side
+    if build_long:
         long_weights = pd.Series(long_leverage / n_long, index=long_tickers)
+    else:
+        long_weights = pd.Series(dtype=float)
+    
+    # Build short side
+    if build_short:
         short_weights = pd.Series(-short_leverage / n_short, index=short_tickers)
+    else:
+        short_weights = pd.Series(dtype=float)
     
     if not enforce_caps:
         return long_weights, short_weights
@@ -113,7 +144,8 @@ def construct_portfolio_simple(
 def construct_portfolio_cvxpy(
     scores: pd.Series,
     universe_metadata: pd.DataFrame,
-    config
+    config,
+    mode: str = 'ls'
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Portfolio construction with CVXPY optimization to enforce caps exactly.
@@ -135,6 +167,8 @@ def construct_portfolio_cvxpy(
         Metadata with cluster_id, cluster_cap, per_etf_cap
     config : ResearchConfig
         Configuration object
+    mode : str, default 'ls'
+        Portfolio mode: 'ls', 'long_only', 'short_only', or 'cash'
         
     Returns
     -------
@@ -143,7 +177,11 @@ def construct_portfolio_cvxpy(
     """
     if not CVXPY_AVAILABLE:
         warnings.warn("CVXPY not available, using simple construction")
-        return construct_portfolio_simple(scores, universe_metadata, config, enforce_caps=True)
+        return construct_portfolio_simple(scores, universe_metadata, config, enforce_caps=True, mode=mode)
+    
+    # Handle cash mode
+    if mode == 'cash':
+        return pd.Series(dtype=float), pd.Series(dtype=float)
     
     # Filter to valid tickers
     valid_tickers = scores.dropna().index.tolist()
@@ -163,12 +201,33 @@ def construct_portfolio_cvxpy(
     long_tickers = sorted_scores.head(n_long).index.tolist()
     short_tickers = sorted_scores.tail(n_short).index.tolist()
     
+    # Determine which sides to build based on mode
+    if mode == 'short_only':
+        build_long = False
+        build_short = True
+    elif mode == 'long_only':
+        build_long = True
+        build_short = False
+    elif mode == 'ls':
+        # Use config flags
+        if config.portfolio.short_only:
+            build_long = False
+            build_short = True
+        elif config.portfolio.long_only:
+            build_long = True
+            build_short = False
+        else:
+            build_long = True
+            build_short = True
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
+    
     # ===== Long portfolio =====
     # Target gross exposure scaled by long_leverage (e.g., 1.0 = 100% of capital)
     long_target_gross = config.portfolio.long_leverage
     
-    if config.portfolio.short_only:
-        # Short only mode: skip long portfolio
+    if not build_long:
+        # Skip long portfolio
         long_weights = pd.Series(dtype=float)
     elif len(long_tickers) > 0:
         long_weights = _optimize_one_side(
@@ -187,8 +246,8 @@ def construct_portfolio_cvxpy(
     # With 50% margin, can only short up to 50% of capital
     short_target_gross = config.portfolio.margin
     
-    if config.portfolio.long_only:
-        # Long only mode: skip short portfolio
+    if not build_short:
+        # Skip short portfolio
         short_weights = pd.Series(dtype=float)
     elif len(short_tickers) > 0:
         short_weights = _optimize_one_side(
@@ -295,7 +354,8 @@ def construct_portfolio(
     scores: pd.Series,
     universe_metadata: pd.DataFrame,
     config,
-    method: str = 'cvxpy'
+    method: str = 'cvxpy',
+    mode: str = 'ls'
 ) -> Tuple[pd.Series, pd.Series, Dict]:
     """
     Main portfolio construction function.
@@ -310,6 +370,8 @@ def construct_portfolio(
         Configuration object
     method : str
         'cvxpy' (optimal) or 'simple' (fast approximation)
+    mode : str
+        Portfolio mode: 'ls' (long/short), 'long_only', 'short_only', 'cash'
         
     Returns
     -------
@@ -319,10 +381,10 @@ def construct_portfolio(
         - portfolio_stats: Dict with diagnostics
     """
     if method == 'cvxpy' and CVXPY_AVAILABLE:
-        long_weights, short_weights = construct_portfolio_cvxpy(scores, universe_metadata, config)
+        long_weights, short_weights = construct_portfolio_cvxpy(scores, universe_metadata, config, mode=mode)
     else:
         long_weights, short_weights = construct_portfolio_simple(
-            scores, universe_metadata, config, enforce_caps=True
+            scores, universe_metadata, config, enforce_caps=True, mode=mode
         )
     
     # Compute portfolio statistics

@@ -9,6 +9,7 @@ Key design principles:
 3. Enforces universe filters: ADV, data quality, duplicates
 4. Enforces portfolio caps: per-ETF and per-cluster
 5. Zero look-ahead bias: training window ends before t0
+6. Regime-aware portfolio construction (optional)
 
 Time structure at each rebalance date t0:
   t_train_start = t0 - TRAINING_WINDOW_DAYS
@@ -26,6 +27,7 @@ import warnings
 from config import ResearchConfig
 from alpha_models import train_alpha_model, AlphaModel
 from portfolio_construction import construct_portfolio, evaluate_portfolio_return
+from regime import compute_regime_series, get_portfolio_mode_for_regime
 
 
 def apply_universe_filters(
@@ -278,6 +280,29 @@ def run_walk_forward_backtest(
         print(f"\nRebalance dates: {len(current_dates)}")
         print(f"Date range: {current_dates[0].date()} to {current_dates[-1].date()}")
     
+    # =====================================================================
+    # Compute regime series (if enabled)
+    # =====================================================================
+    regime_series = None
+    if config.regime.use_regime:
+        if verbose:
+            print(f"\n[regime] Computing regime series...")
+            print(f"  Market ticker: {config.regime.market_ticker}")
+            print(f"  MA window: {config.regime.ma_window} days")
+            print(f"  Return lookback: {config.regime.lookback_return_days} days")
+        
+        try:
+            regime_series = compute_regime_series(panel_df, config.regime, verbose=verbose)
+            if verbose:
+                print(f"[regime] Computed {len(regime_series)} regime values")
+                regime_counts = regime_series.value_counts()
+                print(f"[regime] Bull: {regime_counts.get('bull', 0)}, Bear: {regime_counts.get('bear', 0)}, Range: {regime_counts.get('range', 0)}")
+        except Exception as e:
+            if verbose:
+                print(f"[warn] Regime computation failed: {e}")
+                print(f"[warn] Proceeding without regime switching")
+            regime_series = None
+    
     results = []
     
     # Track previous weights for turnover calculation
@@ -399,12 +424,25 @@ def run_walk_forward_backtest(
                 universe_metadata.index.isin(eligible_universe.index)
             ].copy()
         
+        # =====================================================================
+        # 5. Determine portfolio mode from regime
+        # =====================================================================
+        if regime_series is not None:
+            # Get regime at t0 (already shifted by 1 day to avoid look-ahead)
+            current_regime = regime_series.get(t0, 'range')  # Default to range if not found
+            mode = get_portfolio_mode_for_regime(current_regime)
+            if verbose:
+                print(f"[regime] Current regime: {current_regime} → mode: {mode}")
+        else:
+            mode = 'ls'  # Default long/short mode
+        
         try:
             long_weights, short_weights, portfolio_stats = construct_portfolio(
                 scores=scores,
                 universe_metadata=eligible_metadata,
                 config=config,
-                method=portfolio_method
+                method=portfolio_method,
+                mode=mode
             )
         except Exception as e:
             if verbose:

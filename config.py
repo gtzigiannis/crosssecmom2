@@ -186,6 +186,31 @@ class ComputeConfig:
 
 
 @dataclass
+class RegimeConfig:
+    """Regime classification parameters."""
+    
+    # Enable/disable regime-based portfolio switching
+    use_regime: bool = False          # If False, use standard long/short mode
+    
+    # Market index for regime detection
+    market_ticker: str = "SPY"        # Ticker to use for regime classification
+    
+    # Moving average parameters
+    ma_window: int = 200              # Days for moving average
+    
+    # Momentum parameters
+    lookback_return_days: int = 63    # Days for return calculation (3 months)
+    
+    # Classification thresholds
+    bull_ret_threshold: float = 0.02  # 2% return threshold for bull regime
+    bear_ret_threshold: float = -0.02 # -2% return threshold for bear regime
+    
+    # Optional hysteresis to reduce regime switching
+    neutral_buffer_days: int = 21     # Days to stay in regime before switching
+    use_hysteresis: bool = False      # Enable/disable hysteresis
+
+
+@dataclass
 class ResearchConfig:
     """Complete research configuration combining all sub-configs."""
     
@@ -195,6 +220,7 @@ class ResearchConfig:
     portfolio: PortfolioConfig
     features: FeatureConfig
     compute: ComputeConfig
+    regime: RegimeConfig
     
     @classmethod
     def default(cls):
@@ -205,7 +231,8 @@ class ResearchConfig:
             universe=UniverseConfig(),
             portfolio=PortfolioConfig(),
             features=FeatureConfig(),
-            compute=ComputeConfig()
+            compute=ComputeConfig(),
+            regime=RegimeConfig()
         )
     
     def validate(self):
