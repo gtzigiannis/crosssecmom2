@@ -616,7 +616,7 @@ from walk_forward_engine import analyze_performance
 stats = analyze_performance(results_df, config)
 ```
 
-**Output**:
+**Example Output Format**:
 ```
 {'Total Periods': 120,
  'Win Rate': '58.33%',
@@ -633,17 +633,27 @@ stats = analyze_performance(results_df, config)
  'Mean Borrowing Cost': '0.14%'}
 ```
 
+> ⚠️ **IMPORTANT**: The statistics above are **illustrative examples** showing the output format, NOT actual backtest results. 
+> 
+> **To generate real results**, you must:
+> 1. Run `python main.py --all --model supervised_binned` to download data and execute full backtest
+> 2. This will download ~10 years of daily data for 116 ETFs from Yahoo Finance
+> 3. Expect 30-60 minutes for complete workflow on high-performance hardware
+> 4. Results will vary based on actual market data, universe composition, and parameters
+>
+> **Current Status**: Code has been tested and validated with unit tests, but full historical backtest has not been executed in this session.
+
 ### Computational Benchmarks
 
 | Operation | Time | Memory |
 |-----------|------|--------|
-| Feature engineering (116 ETFs, 10 years) | 8-12 min | 4-8 GB |
-| Universe metadata (with clustering) | 1-2 min | 1-2 GB |
-| Walk-forward backtest (120 periods) | 10-20 min | 3-5 GB |
-| Per-period model training | 2-5 sec | 500 MB |
-| Per-period portfolio construction | <1 sec | 100 MB |
+| Feature engineering (116 ETFs, 10 years) | 3-5 min | 2-4 GB |
+| Universe metadata (with clustering) | 30-60 sec | 500 MB - 1 GB |
+| Walk-forward backtest (120 periods) | 5-10 min | 2-3 GB |
+| Per-period model training | 1-2 sec | 300 MB |
+| Per-period portfolio construction | <1 sec | 50 MB |
 
-*Intel i7, 16GB RAM, SSD*
+*Azure Standard_DS5_v2 (16 cores, 128 GB RAM, Premium SSD) - Estimated based on code complexity*
 
 ---
 

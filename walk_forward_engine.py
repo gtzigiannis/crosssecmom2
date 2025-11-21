@@ -316,7 +316,7 @@ def run_walk_forward_backtest(
             print(f"[train] Training {model_type} model...")
         
         try:
-            model = train_alpha_model(
+            model, selected_features, ic_series = train_alpha_model(
                 panel=panel_df,
                 universe_metadata=universe_metadata,
                 t_train_start=t_train_start,
@@ -324,6 +324,15 @@ def run_walk_forward_backtest(
                 config=config,
                 model_type=model_type
             )
+            
+            # Record diagnostics
+            diagnostics_entry = {
+                'date': t0,
+                'n_features': len(selected_features),
+                'selected_features': selected_features,
+                'ic_values': ic_series.to_dict() if ic_series is not None else {}
+            }
+            
         except Exception as e:
             if verbose:
                 print(f"[error] Model training failed: {e}")
@@ -343,6 +352,9 @@ def run_walk_forward_backtest(
         
         if verbose:
             print(f"[universe] Eligible tickers: {len(eligible_universe)}")
+        
+        # Add universe size to diagnostics
+        diagnostics_entry['universe_size'] = len(eligible_universe)
         
         # =====================================================================
         # 4. Score eligible tickers
@@ -444,6 +456,9 @@ def run_walk_forward_backtest(
         
         results.append(performance)
         
+        # Append diagnostics for this period
+        diagnostics.append(diagnostics_entry)
+        
         # Update previous weights for next iteration
         prev_long_weights = long_weights.copy()
         prev_short_weights = short_weights.copy()
@@ -466,6 +481,63 @@ def run_walk_forward_backtest(
         print("="*80)
         print(f"Total periods: {len(results_df)}")
         print(f"Date range: {results_df.index[0].date()} to {results_df.index[-1].date()}")
+    
+    # Save diagnostics if requested
+    if config.compute.save_intermediate and len(diagnostics) > 0:
+        import json
+        from pathlib import Path
+        
+        # Determine output path
+        if config.compute.ic_output_path:
+            diag_dir = Path(config.compute.ic_output_path).parent
+        else:
+            diag_dir = Path(config.paths.plots_dir)
+        
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save summary diagnostics to CSV
+        diag_summary = []
+        for entry in diagnostics:
+            # Get top 5 features by |IC|
+            if entry['ic_values']:
+                ic_dict = entry['ic_values']
+                abs_ic = {k: abs(v) for k, v in ic_dict.items() if pd.notna(v)}
+                top_features = sorted(abs_ic.items(), key=lambda x: x[1], reverse=True)[:5]
+                top_features_str = '; '.join([f"{k}={v:.3f}" for k, v in top_features])
+            else:
+                top_features_str = ""
+            
+            diag_summary.append({
+                'date': entry['date'],
+                'universe_size': entry['universe_size'],
+                'n_features': entry['n_features'],
+                'top_5_features': top_features_str
+            })
+        
+        diag_df = pd.DataFrame(diag_summary)
+        diag_csv_path = diag_dir / 'diagnostics_summary.csv'
+        diag_df.to_csv(diag_csv_path, index=False)
+        
+        # Save full IC history to JSON
+        ic_json_path = diag_dir / 'ic_history.json'
+        with open(ic_json_path, 'w') as f:
+            # Convert dates to strings for JSON serialization
+            json_data = []
+            for entry in diagnostics:
+                json_entry = {
+                    'date': entry['date'].isoformat(),
+                    'universe_size': entry['universe_size'],
+                    'n_features': entry['n_features'],
+                    'selected_features': entry['selected_features'],
+                    'ic_values': entry['ic_values']
+                }
+                json_data.append(json_entry)
+            json.dump(json_data, f, indent=2)
+        
+        if verbose:
+            print(f"\n[save] Diagnostics saved to:")
+            print(f"  Summary: {diag_csv_path}")
+            print(f"  Full IC history: {ic_json_path}")
     
     return results_df
 

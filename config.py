@@ -51,7 +51,8 @@ class UniverseConfig:
     
     # Data quality
     min_data_quality: float = 0.80    # Minimum fraction of non-NaN features
-    min_history_days: int = 252       # Minimum history required (1 year)
+    # NOTE: min_history_days removed - history requirement is determined by
+    # FEATURE_MAX_LAG_DAYS + TRAINING_WINDOW_DAYS in walk_forward_engine
     
     # Metadata filters
     exclude_leveraged: bool = True    # Exclude leveraged/inverse ETFs
@@ -71,7 +72,8 @@ class PortfolioConfig:
     # Position sizing
     long_quantile: float = 0.9   # Top 10% for long portfolio
     short_quantile: float = 0.1  # Bottom 10% for short portfolio
-    leverage: float = 1.0         # Portfolio leverage (1.0 = 100% long + 100% short)
+    long_leverage: float = 1.0    # Long leverage (1.0 = 100% of capital on long side)
+                                  # Shorts are separately limited by margin parameter
     
     # Portfolio mode
     long_only: bool = False      # If True, only construct long positions (cash otherwise)
@@ -222,7 +224,7 @@ class ResearchConfig:
         # Portfolio constraints
         assert 0 < self.portfolio.long_quantile < 1, "long_quantile must be in (0, 1)"
         assert 0 < self.portfolio.short_quantile < 1, "short_quantile must be in (0, 1)"
-        assert self.portfolio.leverage >= 0, "leverage must be non-negative"
+        assert self.portfolio.long_leverage >= 0, "long_leverage must be non-negative"
         assert not (self.portfolio.long_only and self.portfolio.short_only), \
             "Cannot set both long_only and short_only to True"
         assert self.portfolio.cash_rate >= 0, "cash_rate must be non-negative"

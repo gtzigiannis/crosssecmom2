@@ -68,8 +68,10 @@ def construct_portfolio_simple(
     short_tickers = sorted_scores.tail(n_short).index
     
     # Equal weights within each side (respecting long_only/short_only flags)
-    # IMPORTANT: Short weights are scaled by margin requirement
-    # With 50% margin, you can only short up to 50% of capital (not 100%)
+    # IMPORTANT: 
+    # - Long positions scaled by long_leverage (typically 1.0 = 100% of capital)
+    # - Short positions scaled by margin requirement (e.g., 50% margin = max 50% short)
+    long_leverage = config.portfolio.long_leverage
     short_leverage = config.portfolio.margin
     
     if config.portfolio.short_only:
@@ -79,11 +81,11 @@ def construct_portfolio_simple(
         short_weights = pd.Series(-short_leverage / n_short, index=short_tickers)
     elif config.portfolio.long_only:
         # Long only mode: no short positions
-        long_weights = pd.Series(1.0 / n_long, index=long_tickers)
+        long_weights = pd.Series(long_leverage / n_long, index=long_tickers)
         short_weights = pd.Series(dtype=float)
     else:
-        # Standard long/short: 100% long, margin-limited short
-        long_weights = pd.Series(1.0 / n_long, index=long_tickers)
+        # Standard long/short: long_leverage on long side, margin-limited short
+        long_weights = pd.Series(long_leverage / n_long, index=long_tickers)
         short_weights = pd.Series(-short_leverage / n_short, index=short_tickers)
     
     if not enforce_caps:
@@ -162,6 +164,9 @@ def construct_portfolio_cvxpy(
     short_tickers = sorted_scores.tail(n_short).index.tolist()
     
     # ===== Long portfolio =====
+    # Target gross exposure scaled by long_leverage (e.g., 1.0 = 100% of capital)
+    long_target_gross = config.portfolio.long_leverage
+    
     if config.portfolio.short_only:
         # Short only mode: skip long portfolio
         long_weights = pd.Series(dtype=float)
@@ -170,7 +175,7 @@ def construct_portfolio_cvxpy(
             tickers=long_tickers,
             scores=scores[long_tickers],
             metadata=metadata_subset.loc[long_tickers],
-            target_gross=1.0,
+            target_gross=long_target_gross,
             side='long',
             config=config
         )
@@ -426,7 +431,8 @@ def evaluate_portfolio_return(
     cash_weight = max(0.0, 1.0 - gross_long - gross_short)
     
     # Convert annual cash rate to holding period return
-    days_per_year = 252  # Trading days
+    # Use 365 calendar days (not 252 trading days) for consistent annual rate conversion
+    days_per_year = 365  # Calendar days
     holding_period_return = config.portfolio.cash_rate * (config.time.HOLDING_PERIOD_DAYS / days_per_year)
     cash_ret = cash_weight * holding_period_return
     
@@ -455,23 +461,37 @@ def evaluate_portfolio_return(
     cost_bps = config.portfolio.total_cost_bps_per_side
     transaction_cost = cost_bps * total_turnover / 10000.0
     
-    # ===== Calculate borrowing costs for shorts =====
-    # When you short, the broker lends you the securities to sell
-    # You pay interest on the FULL notional value borrowed (100% of short position)
-    # The margin (e.g., 50%) is what YOU put up as collateral
+    # ===== Calculate borrowing costs =====
+    # IMPORTANT: Borrowing costs apply to BOTH long AND short positions
     # 
-    # Example: To short $100k of stock with 50% margin:
-    #   - You post $50k margin (your capital)
-    #   - Broker lends you $100k worth of securities
-    #   - You pay borrow_cost on the full $100k
+    # For LONG positions:
+    #   - In practice, you're borrowing cash to buy securities (margin buying)
+    #   - You pay interest on the borrowed amount
+    #   - With long_leverage = 1.0, you use 100% of capital (no borrowing)
+    #   - With long_leverage > 1.0, you borrow: borrow_amount = (long_leverage - 1.0) * capital
     # 
-    # Cost = borrow_cost * gross_short * (holding_days / 365)
-    # NOTE: We do NOT multiply by margin here - you pay on the full borrowed amount
+    # For SHORT positions:
+    #   - You borrow securities to sell them
+    #   - You pay interest on the FULL notional value borrowed
+    #   - With margin = 50%, you post 50% collateral but borrow 100% notional
+    # 
+    # Cost = borrow_cost * borrowed_notional * (holding_days / 365)
+    # NOTE: Use 365 calendar days for consistent annual rate conversion
+    
     borrow_cost_ret = 0.0
+    
+    # Borrowing cost for longs (only if leveraged beyond 1.0)
+    if gross_long > 1.0:
+        borrowed_long = gross_long - 1.0
+        borrow_cost_ret += (config.portfolio.borrow_cost * 
+                           borrowed_long * 
+                           (config.time.HOLDING_PERIOD_DAYS / 365.0))
+    
+    # Borrowing cost for shorts (on full notional)
     if gross_short > 0:
-        borrow_cost_ret = (config.portfolio.borrow_cost * 
-                          gross_short * 
-                          (config.time.HOLDING_PERIOD_DAYS / 365.0))
+        borrow_cost_ret += (config.portfolio.borrow_cost * 
+                           gross_short * 
+                           (config.time.HOLDING_PERIOD_DAYS / 365.0))
     
     # Total return (long + short + cash - transaction costs - borrow costs)
     ls_return = long_ret + short_ret + cash_ret - transaction_cost - borrow_cost_ret

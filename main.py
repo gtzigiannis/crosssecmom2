@@ -15,7 +15,7 @@ import pandas as pd
 from pathlib import Path
 
 from config import get_default_config, ResearchConfig
-from universe_metadata import build_universe_metadata
+from universe_metadata import build_universe_metadata, validate_universe_metadata
 from feature_engineering import run_feature_engineering
 from walk_forward_engine import run_walk_forward_backtest, analyze_performance
 
@@ -92,6 +92,9 @@ def step_2_build_metadata(config: ResearchConfig, returns_df=None):
             high_risk_families=config.portfolio.high_risk_families,
         )
     
+    # Validate metadata
+    universe_metadata = validate_universe_metadata(universe_metadata, config)
+    
     # Save metadata
     universe_metadata.to_csv(config.paths.universe_metadata_output, index=False)
     print(f"\n[save] Universe metadata saved to: {config.paths.universe_metadata_output}")
@@ -142,6 +145,9 @@ def step_3_backtest(
     if universe_metadata is None:
         print(f"[load] Loading universe metadata from {config.paths.universe_metadata_output}")
         universe_metadata = pd.read_csv(config.paths.universe_metadata_output)
+    
+    # Validate metadata before backtest
+    universe_metadata = validate_universe_metadata(universe_metadata, config)
     
     # Run backtest
     results_df = run_walk_forward_backtest(

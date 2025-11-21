@@ -536,6 +536,80 @@ def build_universe_metadata(
     return meta, cluster_caps
 
 
+def validate_universe_metadata(
+    universe_metadata: pd.DataFrame,
+    config
+) -> pd.DataFrame:
+    """
+    Validate universe_metadata has required columns and fill sensible defaults.
+    
+    Required columns:
+    - ticker: ETF ticker symbol
+    - in_core_after_duplicates: Boolean flag for core universe membership
+    - cluster_id: Theme cluster assignment
+    - cluster_cap: Maximum exposure per cluster
+    - per_etf_cap: Maximum exposure per ETF
+    
+    Parameters
+    ----------
+    universe_metadata : pd.DataFrame
+        ETF metadata to validate
+    config : ResearchConfig
+        Configuration for default values
+        
+    Returns
+    -------
+    pd.DataFrame
+        Validated metadata with defaults filled
+    """
+    meta = universe_metadata.copy()
+    
+    # Check for ticker column
+    if 'ticker' not in meta.columns:
+        raise ValueError("universe_metadata must have 'ticker' column")
+    
+    # Ensure ticker is in index for convenient lookups
+    if meta.index.name != 'ticker':
+        if 'ticker' in meta.columns:
+            meta = meta.set_index('ticker', drop=False)
+    
+    # Fill in_core_after_duplicates (default: True = all tickers are in core)
+    if 'in_core_after_duplicates' not in meta.columns:
+        print("[validate] Warning: 'in_core_after_duplicates' not found, assuming all tickers are in core")
+        meta['in_core_after_duplicates'] = True
+    
+    # Fill cluster_id (default: NaN = no cluster assignment)
+    if 'cluster_id' not in meta.columns:
+        print("[validate] Warning: 'cluster_id' not found, setting to NaN (no clustering)")
+        meta['cluster_id'] = np.nan
+    
+    # Fill cluster_cap (default from config)
+    if 'cluster_cap' not in meta.columns:
+        print(f"[validate] Warning: 'cluster_cap' not found, using default {config.portfolio.default_cluster_cap}")
+        meta['cluster_cap'] = config.portfolio.default_cluster_cap
+    
+    # Fill missing cluster_cap values
+    missing_cluster_cap = meta['cluster_cap'].isna()
+    if missing_cluster_cap.any():
+        print(f"[validate] Filling {missing_cluster_cap.sum()} missing cluster_cap values with default {config.portfolio.default_cluster_cap}")
+        meta.loc[missing_cluster_cap, 'cluster_cap'] = config.portfolio.default_cluster_cap
+    
+    # Fill per_etf_cap (default from config)
+    if 'per_etf_cap' not in meta.columns:
+        print(f"[validate] Warning: 'per_etf_cap' not found, using default {config.portfolio.default_per_etf_cap}")
+        meta['per_etf_cap'] = config.portfolio.default_per_etf_cap
+    
+    # Fill missing per_etf_cap values
+    missing_per_etf_cap = meta['per_etf_cap'].isna()
+    if missing_per_etf_cap.any():
+        print(f"[validate] Filling {missing_per_etf_cap.sum()} missing per_etf_cap values with default {config.portfolio.default_per_etf_cap}")
+        meta.loc[missing_per_etf_cap, 'per_etf_cap'] = config.portfolio.default_per_etf_cap
+    
+    print(f"[validate] Validated {len(meta)} tickers, {meta['in_core_after_duplicates'].sum()} in core universe")
+    
+    return meta
+
+
 if __name__ == "__main__":
     # Example usage
     import sys

@@ -370,12 +370,18 @@ def train_alpha_model(
         
     Returns
     -------
-    AlphaModel
-        Trained model object
+    tuple
+        (model, selected_features, ic_series)
+        - model: AlphaModel object
+        - selected_features: List of feature names used
+        - ic_series: pd.Series of IC values for all features
     """
     if model_type == 'momentum_rank':
-        # Simple baseline: just return momentum rank model
-        return MomentumRankModel(feature='Close%-63')
+        # Simple baseline: just return momentum rank model with empty diagnostics
+        baseline_feature = 'Close%-63'
+        return (MomentumRankModel(feature=baseline_feature), 
+                [baseline_feature], 
+                pd.Series({baseline_feature: np.nan}))
     
     # ===== Supervised binned model =====
     
@@ -386,7 +392,10 @@ def train_alpha_model(
     
     if len(train_data) == 0:
         warnings.warn(f"No training data in [{t_train_start}, {t_train_end}]")
-        return MomentumRankModel(feature='Close%-63')
+        baseline_feature = 'Close%-63'
+        return (MomentumRankModel(feature=baseline_feature), 
+                [baseline_feature], 
+                pd.Series({baseline_feature: np.nan}))
     
     # ===== CRITICAL: Restrict to core universe (eligible tickers) =====
     # Only train on tickers that are in the core universe after duplicate removal
@@ -407,13 +416,19 @@ def train_alpha_model(
         
         if len(train_data) == 0:
             warnings.warn(f"No core ticker data in training window")
-            return MomentumRankModel(feature='Close%-63')
+            baseline_feature = 'Close%-63'
+            return (MomentumRankModel(feature=baseline_feature), 
+                    [baseline_feature], 
+                    pd.Series({baseline_feature: np.nan}))
     
     # Target column
     target_col = f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}'
     if target_col not in train_data.columns:
         warnings.warn(f"Target {target_col} not found in panel")
-        return MomentumRankModel(feature='Close%-63')
+        baseline_feature = 'Close%-63'
+        return (MomentumRankModel(feature=baseline_feature), 
+                [baseline_feature], 
+                pd.Series({baseline_feature: np.nan}))
     
     # ===== 1. Supervised binning =====
     print(f"[train] Fitting supervised bins on training window...")
@@ -474,7 +489,10 @@ def train_alpha_model(
     
     if len(selected_features) == 0:
         warnings.warn("No features passed IC threshold, using momentum rank")
-        return MomentumRankModel(feature='Close%-63')
+        baseline_feature = 'Close%-63'
+        return (MomentumRankModel(feature=baseline_feature), 
+                [baseline_feature], 
+                pd.Series({baseline_feature: np.nan}))
     
     print(f"[train] Selected {len(selected_features)} features by IC")
     print(f"[train] Top 5 by |IC|: {abs_ic[selected_features].nlargest(5).to_dict()}")
@@ -492,7 +510,8 @@ def train_alpha_model(
         feature_ics=ic_series
     )
     
-    return model
+    # Return model along with diagnostics
+    return model, selected_features, ic_series
 
 
 if __name__ == "__main__":
