@@ -238,14 +238,19 @@ config.features.random_state = 42        # For reproducibility
 # Portfolio parameters
 config.portfolio.long_quantile = 0.85    # Top 15%
 config.portfolio.short_quantile = 0.15   # Bottom 15%
-config.portfolio.leverage = 1.0
+config.portfolio.long_leverage = 1.0     # 1.0 = 100% position, 1.5 = 150% position
+config.portfolio.short_notional = 0.50   # 50% short exposure (max allowed by margin)
 config.portfolio.long_only = False       # Standard long/short
 config.portfolio.short_only = False
-config.portfolio.margin = 0.50          # 50% margin (limits short to 50%)
+
+# Margin requirements (NEW)
+config.portfolio.long_margin_req = 0.50  # 50% Reg T margin for longs
+config.portfolio.short_margin_req = 0.50 # 50% margin for shorts
 
 # Cost parameters
 config.portfolio.commission_bps = 1.0    # 1 bps commission
 config.portfolio.slippage_bps = 2.0      # 2 bps slippage
+config.portfolio.total_cost_bps_per_side = 3.0  # Total: commission + slippage
 config.portfolio.borrow_cost = 0.05      # 5% annual borrowing rate
 config.portfolio.cash_rate = 0.045       # 4.5% annual cash rate
 
@@ -289,6 +294,19 @@ config.validate()  # Raises AssertionError if invalid
 
 ## Cost Modeling
 
+### Overview
+
+The backtest includes **complete, transparent cash accounting** that tracks every dollar from initial capital through deployment, borrowing, financing, and returns.
+
+Every period's results include a comprehensive `cash_ledger` dictionary with 15+ components showing:
+- Where capital is deployed (margin accounts)
+- How much cash sits uninvested (earning interest)  
+- How much is borrowed (incurring costs)
+- All financing income and expenses
+- Complete P&L breakdown
+
+**Automatic Verification**: Built-in checks ensure `margin_posted + cash_balance = initial_capital` ✓
+
 ### Transaction Costs
 
 **Formula**: `cost = (commission_bps + slippage_bps) × turnover / 10000`
@@ -312,57 +330,157 @@ Where:
 
 ### Borrowing Costs
 
-**Formula**: `cost = borrow_rate × gross_short × (days / 365)`
+**For Long Positions**:
+```
+borrowed_long = gross_long × (1 - long_margin_req)
+cost_long = borrow_rate × borrowed_long × (days / 365)
+```
+
+**For Short Positions**:
+```
+borrowed_short = gross_short  # Always full notional
+cost_short = borrow_rate × borrowed_short × (days / 365)
+```
 
 **Key Points**:
-1. **Paid on FULL notional** of short positions (not margin-adjusted)
-2. Annualized rate (365-day basis)
-3. Accrued over holding period
+1. **Longs**: Pay interest on unfunded portion (depends on margin requirement)
+   - With 50% margin: borrow 50% of position value even at 100% position
+   - Example: 100% long → post 50% margin, borrow 50%
+   
+2. **Shorts**: Pay interest on FULL notional (regardless of margin)
+   - Margin determines collateral needed, not interest base
+   - Example: 50% short → post 25% margin, pay interest on 50%
 
-**Example**:
-- Short exposure: 50% of capital
-- Borrow rate: 5% annual
+3. Annualized rate (365-day basis)
+4. Accrued over holding period
+
+**Examples**:
+
+*Standard Portfolio (100% long + 50% short with 50% margin)*:
+- Long borrowing: 1.0 × (1 - 0.5) = 0.5 (50% of capital)
+- Short borrowing: 0.5 (full notional)
+- Total borrowed: 1.0 (100% of capital)
 - Holding period: 21 days
-- Cost = 0.05 × 0.50 × (21/365) = 0.001438 = 0.14%
+- Borrow rate: 5% annual
+- Long cost = 0.05 × 0.5 × (21/365) = 0.001438 = 0.14%
+- Short cost = 0.05 × 0.5 × (21/365) = 0.001438 = 0.14%
+- Total borrowing cost = 0.2877%
 
-**Why no margin multiplier?**:
-- Margin (50%) determines HOW MUCH you can borrow
-- But you pay interest on the FULL amount borrowed
-- Margin is collateral, not the borrowing amount
+*Long-Only (100% long with 50% margin)*:
+- Long borrowing: 1.0 × (1 - 0.5) = 0.5
+- Short borrowing: 0 (no shorts)
+- Total cost = 0.05 × 0.5 × (21/365) = 0.14%
 
-**Implementation**: `portfolio_construction.py:calculate_borrowing_cost()`
+**Critical Fix**: Previously only charged borrowing on longs when `gross_long > 1.0`, 
+missing the fact that with 50% margin we always borrow 50% of position value.
 
-### Margin Requirements
+**Implementation**: `portfolio_construction.py:evaluate_portfolio_return()`
 
-**Concept**: Broker requires X% margin to short securities.
+### Cash Interest
 
-**Impact**:
-- 50% margin means max short exposure = 50% of capital
-- This is a LEVERAGE CONSTRAINT, not a cost multiplier
-- Short weights scaled: `short_weights = -margin / n_short`
+**Formula**: `cash_return = cash_rate × cash_balance × (days / 365)`
 
-**Example Exposures**:
+**Cash Balance Calculation**:
+```python
+cash_balance = 1.0 - (gross_long × long_margin_req + gross_short × short_margin_req)
 ```
-Standard (margin=50%):  100% long + 50% short
-Long-only:              100% long + 0% short + cash interest on uninvested
-Short-only:             0% long + 50% short (limited by margin)
-```
 
-**Implementation**:
-- `portfolio_construction.py:construct_portfolio_simple()` - scales weights
-- `portfolio_construction.py:construct_portfolio_cvxpy()` - constrains optimization
+**Key Points**:
+1. Earn interest on ALL uninvested capital
+2. Cash balance depends on margin requirements, not gross exposures
+3. Annualized rate (365-day basis)
 
-### Cash Rate
+**Examples**:
 
-**When Applied**: Long-only mode on uninvested capital
-
-**Formula**: `cash_return = cash_rate × (1 - gross_long) × (days / 365)`
-
-**Example**:
-- Long 80% of capital (bottom quintile excluded)
+*Standard L/S (100% long + 50% short, 50% margin)*:
+- Long margin: 1.0 × 0.5 = 0.5
+- Short margin: 0.5 × 0.5 = 0.25
+- Cash balance: 1.0 - 0.75 = 0.25 (25% uninvested)
 - Cash rate: 4.5% annual
-- Holding: 21 days
-- Cash return = 0.045 × 0.20 × (21/365) = 0.000518 = 0.052%
+- Interest earned = 0.045 × 0.25 × (21/365) = 0.000647 = 0.065%
+
+*Long-Only (100% long, 50% margin)*:
+- Cash balance: 1.0 - 0.5 = 0.5 (50% uninvested)
+- Interest earned = 0.045 × 0.5 × (21/365) = 0.001295 = 0.13%
+
+*Leveraged (150% long + 50% short, 50% margin)*:
+- Cash balance: 1.0 - (0.75 + 0.25) = 0 (fully deployed)
+- Interest earned = 0 (no uninvested cash)
+
+**Critical Fix**: Previously calculated cash as `1.0 - gross_long - gross_short`, 
+which incorrectly ignored margin requirements and produced negative cash positions.
+
+**Implementation**: `portfolio_construction.py:evaluate_portfolio_return()`
+
+### Accessing the Cash Ledger
+
+Every period's results include a complete cash ledger:
+
+```python
+# Run backtest
+results = run_walk_forward_backtest(...)
+
+# Access ledger for any period
+ledger = results.iloc[0]['cash_ledger']
+
+# View all components
+print(f"Initial capital: {ledger['initial_capital_weight']}")
+print(f"Margin posted: {ledger['total_margin_posted']}")
+print(f"Cash balance: {ledger['cash_balance']}")
+print(f"Total borrowed: {ledger['total_borrowed']}")
+print(f"Cash interest: {ledger['cash_interest_earned']}")
+print(f"Borrow cost: {ledger['borrowing_cost_charged']}")
+print(f"Net financing: {ledger['net_financing_cost']}")
+
+# Convert to dollar amounts
+initial_capital = 1_000_000
+print(f"\nWith ${initial_capital:,.0f} capital:")
+print(f"  Margin: ${ledger['total_margin_posted'] * initial_capital:,.0f}")
+print(f"  Cash: ${ledger['cash_balance'] * initial_capital:,.0f}")
+print(f"  Borrowed: ${ledger['total_borrowed'] * initial_capital:,.0f}")
+```
+
+**Complete Ledger Structure**:
+```python
+{
+    # Capital deployment
+    'initial_capital_weight': 1.0,
+    'long_margin_posted': 0.50,
+    'short_margin_posted': 0.25,
+    'total_margin_posted': 0.75,
+    'cash_balance': 0.25,
+    
+    # Position exposures
+    'gross_long': 1.0,
+    'gross_short': 0.5,
+    'net_exposure': 0.5,
+    
+    # Borrowing
+    'borrowed_long': 0.50,
+    'borrowed_short': 0.50,
+    'total_borrowed': 1.00,
+    
+    # Financing (per period)
+    'cash_interest_earned': 0.000647,
+    'borrowing_cost_charged': 0.002877,
+    'net_financing_cost': -0.002229,
+    
+    # Asset returns
+    'long_asset_return': 0.0145,
+    'short_asset_return': -0.0060,
+    'total_asset_return': 0.0205,
+    
+    # Total P&L
+    'total_return': 0.0183
+}
+```
+
+**Verification**: The ledger automatically checks that capital accounting is balanced:
+```python
+assert abs(ledger['total_margin_posted'] + ledger['cash_balance'] - 1.0) < 1e-6
+```
+
+See `CASH_LEDGER_COMPLETE.md` for full documentation and examples.
 
 ---
 
@@ -1036,7 +1154,110 @@ python TEST_ADVANCED_FIXES.py  # See test_margin_limits_short_exposure()
 
 ---
 
-## Recent Improvements (Session Summary)
+## Recent Improvements (Latest Session)
+
+### Leverage and Margin Mechanics Overhaul (6 critical fixes)
+
+1. ✅ **Leverage Interpretation Corrected**
+   - Fixed: `long_leverage` now correctly means "target position / capital" not "% to allocate"
+   - Example: 1.5x leverage = 150% position with 100% capital (borrow 50%)
+   - Impact: Completely corrected position sizing for leveraged strategies
+   - File: `config.py`, `portfolio_construction.py`
+
+2. ✅ **Cash Calculation Fixed with Margin Requirements**
+   - OLD (WRONG): `cash = 1.0 - gross_long - gross_short` (ignored margin)
+   - NEW (CORRECT): `cash = 1.0 - (gross_long × long_margin_req + gross_short × short_margin_req)`
+   - Example: 100% long + 50% short with 50% margin → 25% cash (not -50%!)
+   - Impact: Fixed impossible negative cash positions
+   - File: `portfolio_construction.py`
+
+3. ✅ **Symmetric Margin Treatment**
+   - Added: `long_margin_req = 0.5` (50% Reg T for longs)
+   - Added: `short_margin_req = 0.5` (50% for ETF shorts)
+   - Previously asymmetric (100% for longs, 50% for shorts)
+   - Impact: Consistent capital accounting on both sides
+   - File: `config.py`
+
+4. ✅ **Parameter Naming Clarified**
+   - Renamed: `margin` → `short_notional` (backward compatible via @property)
+   - `margin` controlled position SIZE, not margin REQUIREMENT (confusing!)
+   - `short_notional` clearly means "how much to short as % of capital"
+   - File: `config.py`
+
+5. ✅ **Borrowing Cost for Longs Fixed**
+   - OLD (WRONG): Only charged if `gross_long > 1.0`
+   - NEW (CORRECT): `borrowed_long = gross_long × (1 - long_margin_req)`
+   - Example: 100% long with 50% margin → borrow 50%, pay interest on 50%
+   - Impact: Was undercharging borrowing costs by ~0.14% per 21-day period
+   - File: `portfolio_construction.py`
+
+6. ✅ **Cash Interest Verification**
+   - Confirmed: Cash interest already correctly implemented
+   - Formula: `cash_ret = cash_weight × cash_rate × (days/365)`
+   - Uninvested capital earns interest at cash_rate (4.5% annual default)
+   - File: `portfolio_construction.py`
+
+**Net Effect on Returns**:
+- More realistic borrowing costs (+~0.14% per period for longs)
+- Cash interest properly credited (+~0.06% per period on 25% cash)
+- Net financing impact: ~-0.08% per period (~-1.4% annualized)
+- **Backtest now accurately reflects real-world margin account mechanics**
+
+### Complete Cash Ledger System
+
+7. ✅ **Transparent Cash Accounting**
+   - Added comprehensive `cash_ledger` dictionary to every period's results
+   - Tracks 15+ components: margin posted, cash balance, borrowing, interest, returns
+   - Automatic verification: `margin_posted + cash_balance = 1.0` ✓
+   - Dollar amount support: multiply weights by initial capital
+   - Files: `portfolio_construction.py`, `CASH_LEDGER_COMPLETE.md`
+
+**Cash Ledger Components**:
+```python
+result['cash_ledger'] = {
+    # Capital deployment
+    'initial_capital_weight': 1.0,
+    'long_margin_posted': 0.50,      # 50% for longs
+    'short_margin_posted': 0.25,     # 25% for shorts
+    'total_margin_posted': 0.75,
+    'cash_balance': 0.25,            # Uninvested cash
+    
+    # Borrowing
+    'borrowed_long': 0.50,           # 50% borrowed for longs
+    'borrowed_short': 0.50,          # 50% borrowed for shorts
+    'total_borrowed': 1.00,
+    
+    # Financing (per 21-day period)
+    'cash_interest_earned': 0.000647,    # +0.0647%
+    'borrowing_cost_charged': 0.002877,  # -0.2877%
+    'net_financing_cost': -0.002229,     # -0.2229%
+    
+    # Asset returns
+    'long_asset_return': 0.0145,
+    'short_asset_return': -0.0060,
+    'total_asset_return': 0.0205,
+    
+    # Total P&L
+    'total_return': 0.0183  # assets + financing - txn_costs
+}
+```
+
+**Example with $1,000,000 Initial Capital**:
+- Margin posted: $750,000 (for 100% long + 50% short)
+- Cash balance: $250,000 (earning 4.5% interest)
+- Total borrowed: $1,000,000 (50% for longs + 50% for shorts)
+- Net financing per 21 days: -$2,229.45
+
+### Testing Infrastructure
+
+- ✅ `test_borrow_cash.py`: Validates borrowing and cash interest calculations
+- ✅ `test_cash_ledger.py`: Tests 5 scenarios with complete cash accounting
+- ✅ `test_ledger_integration.py`: Verifies ledger populated in actual backtest
+- ✅ All tests passing with $1M capital examples
+
+---
+
+## Previous Improvements
 
 ### Basic Correctness Fixes (4 items)
 

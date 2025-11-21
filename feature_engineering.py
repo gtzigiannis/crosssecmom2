@@ -19,7 +19,6 @@ Output: Panel with (Date, Ticker) MultiIndex containing:
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import time
 import os
 from datetime import datetime
@@ -28,6 +27,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from config import ResearchConfig
+from data_manager import download_etf_data  # Import from data_manager instead
 
 # ============================================================================
 # NUMBA-ACCELERATED FUNCTIONS
@@ -225,7 +225,9 @@ def adv_features(close, volume, window=63):
     
     ADV is a proper liquidity measure: higher values = more liquid.
     """
-    if volume is None or volume.isna().all():
+    if volume is None:
+        return {}
+    if bool(volume.isna().all()):
         return {}
     
     # Dollar volume = Close * Volume
@@ -242,7 +244,7 @@ def adv_features(close, volume, window=63):
 # PER-TICKER FEATURE ENGINEERING
 # ============================================================================
 
-def process_ticker(ticker: str, data: pd.DataFrame) -> pd.DataFrame:
+def process_ticker(ticker: str, data: pd.DataFrame, adv_window: int = 63) -> pd.DataFrame:
     """
     Engineer features for a single ticker.
     
@@ -254,6 +256,8 @@ def process_ticker(ticker: str, data: pd.DataFrame) -> pd.DataFrame:
         Ticker symbol
     data : pd.DataFrame
         Raw OHLCV data with DatetimeIndex
+    adv_window : int
+        Window for ADV calculation (default: 63)
         
     Returns
     -------
@@ -301,17 +305,24 @@ def process_ticker(ticker: str, data: pd.DataFrame) -> pd.DataFrame:
         # Liquidity: ADV (replaces VPT)
         if 'Volume' in data.columns:
             vol = data['Volume'].astype('float32')
-            feats.update(adv_features(close, vol, window=63))
+            feats.update(adv_features(close, vol, window=adv_window))
         
         # Hurst exponent on returns
         feats.update(hurst_multi(close_pct, [21, 63, 126]))
         
         # Convert to DataFrame
         df = pd.DataFrame(feats, index=data.index)
-        return df.astype('float32')
+        
+        # Convert numeric columns to float32, keep Ticker as string
+        numeric_cols = df.select_dtypes(include=['number']).columns
+        df[numeric_cols] = df[numeric_cols].astype('float32')
+        
+        return df
         
     except Exception as e:
+        import traceback
         print(f"[error] {ticker}: {e}")
+        traceback.print_exc()
         return pd.DataFrame(index=data.index)
 
 # ============================================================================
@@ -381,55 +392,6 @@ def add_adv_rank(panel_df: pd.DataFrame, adv_col: str = 'ADV_63') -> pd.DataFram
     return panel_df
 
 # ============================================================================
-# DATA DOWNLOAD
-# ============================================================================
-
-def download_etf_data(
-    tickers: list,
-    start_date: str,
-    end_date: str,
-    batch_sleep: float = 1.0
-) -> dict:
-    """
-    Download OHLCV data for all tickers.
-    
-    Returns
-    -------
-    dict
-        {ticker: DataFrame} with OHLCV data
-    """
-    print(f"[download] Fetching data for {len(tickers)} ETFs from {start_date} to {end_date}...")
-    
-    data_dict = {}
-    failed = []
-    
-    for i, ticker in enumerate(tickers):
-        try:
-            df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-            if df.empty:
-                failed.append(ticker)
-                continue
-            
-            # Keep only OHLCV
-            df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
-            df = df.astype('float32')
-            data_dict[ticker] = df
-            
-            if (i + 1) % 20 == 0:
-                print(f"[download] Progress: {i+1}/{len(tickers)}")
-                time.sleep(batch_sleep)
-                
-        except Exception as e:
-            print(f"[error] {ticker}: {e}")
-            failed.append(ticker)
-    
-    print(f"[download] Successfully downloaded: {len(data_dict)}/{len(tickers)}")
-    if failed:
-        print(f"[download] Failed tickers: {failed}")
-    
-    return data_dict
-
-# ============================================================================
 # MAIN PIPELINE
 # ============================================================================
 
@@ -482,7 +444,7 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     print("\n[3/6] Engineering features per ticker...")
     
     results = Parallel(n_jobs=config.compute.n_jobs, backend='threading', verbose=5)(
-        delayed(process_ticker)(ticker, data_dict[ticker])
+        delayed(process_ticker)(ticker, data_dict[ticker], config.universe.adv_window)
         for ticker in data_dict.keys()
     )
     
@@ -521,7 +483,8 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     # 6. Add ADV rank for filtering
     # -------------------------------------------------------------------------
     print("\n[6/6] Adding ADV cross-sectional rank...")
-    panel_df = add_adv_rank(panel_df, 'ADV_63')
+    adv_col = f'ADV_{config.universe.adv_window}'
+    panel_df = add_adv_rank(panel_df, adv_col)
     
     # Set final index
     panel_df = panel_df.set_index(['Date', 'Ticker']).sort_index()
@@ -555,7 +518,11 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     print("="*80)
     latest_date = panel_df.index.get_level_values('Date').max()
     sample = panel_df.loc[latest_date].head(5)
-    print(sample[['Close', 'Close%-21', 'Close%-63', 'Mom21', 'RSI14', 'ADV_63', f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}']].to_string())
+    
+    # Display available columns (some may exist, some may not depending on data)
+    display_cols = ['Close', 'Close%-21', 'Close%-63', 'Close_Mom21', 'Close_RSI14', 'ADV_63', f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}']
+    available_cols = [col for col in display_cols if col in sample.columns]
+    print(sample[available_cols].to_string())
     
     print("\n[done] Feature engineering complete!")
     return panel_df

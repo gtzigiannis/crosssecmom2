@@ -80,10 +80,12 @@ def construct_portfolio_simple(
     
     # Equal weights within each side
     # IMPORTANT: 
-    # - Long positions scaled by long_leverage (typically 1.0 = 100% of capital)
-    # - Short positions scaled by margin requirement (e.g., 50% margin = max 50% short)
+    # - Long positions scaled by long_leverage (target position size)
+    #   Example: long_leverage = 1.0 means 100% long position
+    # - Short positions scaled by short_notional (target short exposure)
+    #   Example: short_notional = 0.5 means 50% short position
     long_leverage = config.portfolio.long_leverage
-    short_leverage = config.portfolio.margin
+    short_leverage = config.portfolio.short_notional
     
     # Determine which sides to build based on mode
     # Priority: explicit mode parameter > config.portfolio flags
@@ -482,15 +484,38 @@ def evaluate_portfolio_return(
         short_ret = 0.0
     
     # Calculate cash return for uninvested capital
-    # Gross exposures
+    # CRITICAL: Cash position depends on MARGIN REQUIREMENTS, not gross exposures
+    # 
+    # Margin requirements determine how much COLLATERAL you need to post:
+    # - Long positions: long_margin_req × gross_long (typically 50% for Reg T)
+    # - Short positions: short_margin_req × gross_short (typically 50% for ETFs)
+    # 
+    # Example: 100% long + 50% short with 50% margin on both:
+    #   long_capital = 1.0 × 0.5 = 0.50
+    #   short_capital = 0.5 × 0.5 = 0.25
+    #   total_margin = 0.75
+    #   cash_weight = 1.0 - 0.75 = 0.25 (25% cash)
+    
     gross_long = long_weights.sum() if len(long_weights) > 0 else 0.0
     gross_short = abs(short_weights.sum()) if len(short_weights) > 0 else 0.0
     
-    # Cash position (uninvested capital)
-    # For long_only: cash = 1.0 - gross_long
-    # For short_only: cash = 1.0 - gross_short
-    # For long/short: cash = 0 (fully invested on both sides)
-    cash_weight = max(0.0, 1.0 - gross_long - gross_short)
+    # Calculate capital tied up as margin
+    long_margin_capital = gross_long * config.portfolio.long_margin_req
+    short_margin_capital = gross_short * config.portfolio.short_margin_req
+    total_margin_capital = long_margin_capital + short_margin_capital
+    
+    # Remaining cash (can be negative if insufficient capital!)
+    cash_weight = 1.0 - total_margin_capital
+    
+    # Warn if insufficient capital
+    if cash_weight < 0:
+        import warnings
+        warnings.warn(
+            f"Insufficient capital at {t0}: need {-cash_weight:.2%} more. "
+            f"Long margin: {long_margin_capital:.2%}, Short margin: {short_margin_capital:.2%}. "
+            f"Consider reducing positions or increasing leverage."
+        )
+        cash_weight = 0.0  # Can't have negative cash in practice
     
     # Convert annual cash rate to holding period return
     # Use 365 calendar days (not 252 trading days) for consistent annual rate conversion
@@ -499,22 +524,36 @@ def evaluate_portfolio_return(
     cash_ret = cash_weight * holding_period_return
     
     # ===== Calculate turnover and transaction costs =====
+    # IMPORTANT: Turnover measures one-way trading volume
+    # - For initial entry (prev_weights = None): charge on full position size
+    # - For rebalancing: charge on net position changes (0.5 factor for one-way)
+    
     turnover_long = 0.0
     turnover_short = 0.0
     
     if prev_long_weights is not None:
-        # Align previous and current weights
+        # Rebalancing: calculate net position changes
         all_tickers = long_weights.index.union(prev_long_weights.index)
         curr_w = long_weights.reindex(all_tickers, fill_value=0.0)
         prev_w = prev_long_weights.reindex(all_tickers, fill_value=0.0)
+        # 0.5 factor converts round-trip turnover to one-way turnover
         turnover_long = 0.5 * (curr_w - prev_w).abs().sum()
+    else:
+        # CRITICAL FIX: First period - charge for initial entry
+        # No 0.5 factor because we're entering from cash (one-way only)
+        turnover_long = long_weights.abs().sum()
     
     if prev_short_weights is not None:
-        # Align previous and current weights (shorts are negative)
+        # Rebalancing: calculate net position changes
         all_tickers = short_weights.index.union(prev_short_weights.index)
         curr_w = short_weights.reindex(all_tickers, fill_value=0.0)
         prev_w = prev_short_weights.reindex(all_tickers, fill_value=0.0)
+        # 0.5 factor converts round-trip turnover to one-way turnover
         turnover_short = 0.5 * (curr_w - prev_w).abs().sum()
+    else:
+        # CRITICAL FIX: First period - charge for initial entry
+        # No 0.5 factor because we're entering from cash (one-way only)
+        turnover_short = short_weights.abs().sum()
     
     total_turnover = turnover_long + turnover_short
     
@@ -524,32 +563,44 @@ def evaluate_portfolio_return(
     transaction_cost = cost_bps * total_turnover / 10000.0
     
     # ===== Calculate borrowing costs =====
-    # IMPORTANT: Borrowing costs apply to BOTH long AND short positions
+    # IMPORTANT: Borrowing costs apply whenever we don't fully fund positions with our capital
     # 
-    # For LONG positions:
-    #   - In practice, you're borrowing cash to buy securities (margin buying)
-    #   - You pay interest on the borrowed amount
-    #   - With long_leverage = 1.0, you use 100% of capital (no borrowing)
-    #   - With long_leverage > 1.0, you borrow: borrow_amount = (long_leverage - 1.0) * capital
+    # For LONG positions (margin buying):
+    #   - We post margin_req × position_size as collateral
+    #   - We borrow the rest: (1 - margin_req) × position_size
+    #   - Example: 100% long with 50% margin:
+    #     * Post 50% margin (our capital)
+    #     * Borrow 50% (from broker)
+    #     * Pay interest on 50% borrowed
+    #   - Example: 150% long with 50% margin:
+    #     * Post 75% margin (50% of 150% position)
+    #     * Borrow 75% (remaining 150% - 75%)
+    #     * Pay interest on 75% borrowed
+    #   - Borrowed amount = gross_long × (1 - margin_req)
     # 
-    # For SHORT positions:
-    #   - You borrow securities to sell them
-    #   - You pay interest on the FULL notional value borrowed
-    #   - With margin = 50%, you post 50% collateral but borrow 100% notional
+    # For SHORT positions (security borrowing):
+    #   - Always borrowing securities (regardless of margin requirement)
+    #   - Borrowed amount = FULL notional shorted
+    #   - Margin requirement determines COLLATERAL needed (not interest base)
+    #   - Example: 50% short with 50% margin:
+    #     * Collateral posted: 25% of capital (50% × 50%)
+    #     * Interest paid on: 50% of capital (full notional)
     # 
-    # Cost = borrow_cost * borrowed_notional * (holding_days / 365)
+    # Cost = borrow_cost × borrowed_notional × (holding_days / 365)
     # NOTE: Use 365 calendar days for consistent annual rate conversion
     
     borrow_cost_ret = 0.0
     
-    # Borrowing cost for longs (only if leveraged beyond 1.0)
-    if gross_long > 1.0:
-        borrowed_long = gross_long - 1.0
+    # Borrowing cost for longs (borrow the unfunded portion)
+    if gross_long > 0:
+        # We post (margin_req × gross_long) as collateral
+        # We borrow the rest: gross_long × (1 - margin_req)
+        borrowed_long = gross_long * (1.0 - config.portfolio.long_margin_req)
         borrow_cost_ret += (config.portfolio.borrow_cost * 
                            borrowed_long * 
                            (config.time.HOLDING_PERIOD_DAYS / 365.0))
     
-    # Borrowing cost for shorts (on full notional)
+    # Borrowing cost for shorts (on full notional, not margin-adjusted)
     if gross_short > 0:
         borrow_cost_ret += (config.portfolio.borrow_cost * 
                            gross_short * 
@@ -557,6 +608,84 @@ def evaluate_portfolio_return(
     
     # Total return (long + short + cash - transaction costs - borrow costs)
     ls_return = long_ret + short_ret + cash_ret - transaction_cost - borrow_cost_ret
+    
+    # ===== CASH LEDGER - Complete Transparency =====
+    # This ledger tracks all cash flows to ensure capital accounting is correct.
+    # 
+    # Starting point: We have 1.0 (100%) of capital available
+    # 
+    # STEP 1: Deploy capital to margin accounts
+    #   - Long margin posted: gross_long × long_margin_req
+    #   - Short margin posted: gross_short × short_margin_req
+    #   - Total margin posted: long_margin_capital + short_margin_capital
+    # 
+    # STEP 2: Calculate remaining cash
+    #   - Cash balance: 1.0 - total_margin_posted
+    #   - This cash earns interest at cash_rate
+    # 
+    # STEP 3: Interest earned on cash
+    #   - Interest: cash_balance × cash_rate × (days/365)
+    #   - Added to account balance
+    # 
+    # STEP 4: Borrowing costs charged
+    #   For longs: borrowed_long = gross_long × (1 - long_margin_req)
+    #   For shorts: borrowed_short = gross_short (always full notional)
+    #   Cost: borrow_cost × borrowed_amount × (days/365)
+    #   - Subtracted from account balance
+    # 
+    # VERIFICATION: 
+    #   total_capital_deployed = margin_posted + cash_balance = 1.0 ✓
+    #   net_financing = cash_interest - borrowing_costs
+    #   final_capital = initial + asset_returns + net_financing - transaction_costs
+    
+    # Build comprehensive cash ledger
+    cash_ledger = {
+        # Initial state
+        'initial_capital_weight': 1.0,  # Always start with 100% of capital
+        
+        # Capital deployment
+        'long_margin_posted': long_margin_capital,
+        'short_margin_posted': short_margin_capital,
+        'total_margin_posted': total_margin_capital,
+        'cash_balance': cash_weight,  # Remaining uninvested cash
+        
+        # Position exposures (for reference)
+        'gross_long': gross_long,
+        'gross_short': gross_short,
+        'net_exposure': gross_long - gross_short,
+        
+        # Borrowing amounts
+        'borrowed_long': gross_long * (1.0 - config.portfolio.long_margin_req) if gross_long > 0 else 0.0,
+        'borrowed_short': gross_short,  # Always full notional for shorts
+        'total_borrowed': (gross_long * (1.0 - config.portfolio.long_margin_req) if gross_long > 0 else 0.0) + gross_short,
+        
+        # Interest and costs (as % return for the period)
+        'cash_interest_earned': cash_ret,  # Interest on uninvested cash
+        'borrowing_cost_charged': borrow_cost_ret,  # Cost of borrowed funds
+        'net_financing_cost': cash_ret - borrow_cost_ret,  # Net of interest earned - costs paid
+        
+        # Transaction costs
+        'transaction_cost': transaction_cost,
+        
+        # Asset returns
+        'long_asset_return': long_ret,
+        'short_asset_return': short_ret,
+        'total_asset_return': long_ret + short_ret,
+        
+        # Total P&L breakdown
+        'total_return': ls_return,  # = asset_returns + net_financing - transaction_costs
+    }
+    
+    # Verification: margin posted + cash balance should equal initial capital
+    capital_check = cash_ledger['total_margin_posted'] + cash_ledger['cash_balance']
+    if abs(capital_check - 1.0) > 1e-6 and cash_ledger['cash_balance'] >= 0:
+        import warnings
+        warnings.warn(
+            f"Cash ledger accounting error at {t0}: "
+            f"Margin posted ({cash_ledger['total_margin_posted']:.4f}) + "
+            f"Cash balance ({cash_ledger['cash_balance']:.4f}) = "
+            f"{capital_check:.4f} != 1.0"
+        )
     
     return {
         'date': t0,
@@ -574,6 +703,8 @@ def evaluate_portfolio_return(
         'n_short': len(short_weights),
         'long_tickers': long_weights.index.tolist() if len(long_weights) > 0 else [],
         'short_tickers': short_weights.index.tolist() if len(short_weights) > 0 else [],
+        # NEW: Complete cash ledger for transparency
+        'cash_ledger': cash_ledger,
     }
 
 

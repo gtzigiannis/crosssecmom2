@@ -14,6 +14,9 @@ from pathlib import Path
 class PathConfig:
     """File paths for data inputs and outputs."""
     
+    # Base data directory
+    data_dir: str = r"D:\REPOSITORY\Data\crosssecmom2"
+    
     # Input paths
     universe_csv: str = r"D:\REPOSITORY\Data\crosssecmom2\etf_universe_names.csv"
     universe_metadata_csv: str = r"D:\REPOSITORY\Data\crosssecmom2\etf_universe_full.csv"  # Full metadata with families
@@ -72,23 +75,33 @@ class PortfolioConfig:
     # Position sizing
     long_quantile: float = 0.9   # Top 10% for long portfolio
     short_quantile: float = 0.1  # Bottom 10% for short portfolio
-    long_leverage: float = 1.0    # Long leverage (1.0 = 100% of capital on long side)
-                                  # Shorts are separately limited by margin parameter
+    long_leverage: float = 1.0    # Long leverage: target long position / capital
+                                  # 1.0 = 100% long (no leverage), 1.5 = 150% long (50% borrowed)
+                                  # When levered, you deploy 100% capital + borrow additional cash
+    short_notional: float = 0.50  # Target short exposure as fraction of capital
+                                  # 0.5 = short up to 50% of capital
+                                  # This is position SIZE, not margin requirement
+    
+    # Margin requirements (collateral needed for positions)
+    long_margin_req: float = 0.50   # Margin requirement for longs (Reg T = 50%)
+                                     # 50% means you need 50% collateral for 100% position
+    short_margin_req: float = 0.50  # Margin requirement for shorts (typically 50% for ETFs)
+                                     # 50% means you need 50% collateral for 100% short position
     
     # Portfolio mode
     long_only: bool = False      # If True, only construct long positions (cash otherwise)
     short_only: bool = False     # If True, only construct short positions (cash otherwise)
     cash_rate: float = 0.045     # Annual interest rate on cash positions (default 4.5%)
     
-    # Transaction costs
-    commission_bps: float = 1.0  # Commission in basis points per side
-    slippage_bps: float = 2.0    # Slippage in basis points per side
+    # Transaction costs (realistic estimates for ETF trading)
+    # Note: "per side" means charged on EACH trade (buy, sell, short, cover)
+    commission_bps: float = 2.0  # Commission in basis points per side (0-2 bps typical)
+    slippage_bps: float = 8.0    # Slippage + market impact per side (5-10 bps for liquid ETFs)
     
-    # Borrowing costs for shorting
-    borrow_cost: float = 0.05    # Annual borrowing cost for shorts (5% on full notional)
-    margin: float = 0.50         # Margin requirement: max short exposure as fraction of capital
-                                 # 50% margin = can short up to 50% of capital
-                                 # You pay borrow_cost on FULL short value (not margin-adjusted)
+    # Borrowing costs
+    borrow_cost: float = 0.05    # Annual borrowing cost (5% typical)
+                                 # For longs: paid on borrowed amount (if long_leverage > 1.0)
+                                 # For shorts: paid on FULL notional shorted (not margin-adjusted)
     
     # Risk limits (default caps)
     default_cluster_cap: float = 0.10  # 10% max per theme cluster
@@ -102,6 +115,12 @@ class PortfolioConfig:
     # High-risk family caps (lower limits)
     high_risk_cluster_cap: float = 0.07  # 7% for risky themes
     high_risk_families: set = None
+    
+    # Backward compatibility alias (deprecated)
+    @property
+    def margin(self) -> float:
+        """Deprecated: Use short_notional instead."""
+        return self.short_notional
     
     def __post_init__(self):
         if self.high_risk_families is None:
@@ -119,9 +138,11 @@ class FeatureConfig:
     """Feature engineering parameters."""
     
     # Base features to compute (these are computed WITHOUT using targets)
+    # NOTE: If None, will auto-discover ALL features from panel data
     base_features: List[str] = None
     
     # Binning candidates (subset of base features for supervised binning)
+    # NOTE: These features get binned to create additional '_Bin' features
     binning_candidates: List[str] = None
     
     # Feature selection
@@ -137,38 +158,32 @@ class FeatureConfig:
     random_state: Optional[int] = 42  # Random seed for reproducible results
     
     def __post_init__(self):
-        if self.base_features is None:
-            # Default base feature list (no binning yet)
-            # FIXED: Match actual column names from feature_engineering.py
-            self.base_features = [
+        # NOTE: base_features will remain None initially
+        # It will be dynamically populated from panel data in alpha_models.py
+        # This ensures ALL generated features are automatically included as candidates
+        
+        if self.binning_candidates is None:
+            # Expanded binning candidates to include diverse feature types
+            # These will be binned to create supervised features
+            self.binning_candidates = [
                 # Returns at multiple horizons
                 'Close%-21', 'Close%-63', 'Close%-126', 'Close%-252',
                 
-                # Momentum (Close_Mom*)
+                # Momentum indicators
                 'Close_Mom21', 'Close_Mom42', 'Close_Mom63',
                 
-                # Volatility (Close_std*, Close_ATR*)
-                'Close_std21', 'Close_std63', 'Close_ATR14',
+                # Volatility measures
+                'Close_std21', 'Close_std42', 'Close_std63', 'Close_std126',
+                'Close_ATR14',
                 
-                # Trend indicators (Close_MA*, Close_EMA*)
-                'Close_MA21', 'Close_MA63', 'Close_EMA21', 'Close_EMA63',
+                # Oscillators
+                'Close_RSI14', 'Close_RSI21', 'Close_RSI42',
                 
-                # Oscillators (Close_RSI*, Close_MACD*)
-                'Close_RSI14', 'Close_RSI21',
-                'Close_MACD', 'Close_MACD_Signl', 'Close_MACD_Histo',
+                # MACD family
+                'Close_MACD', 'Close_MACD_Histo',
                 
-                # Liquidity
-                'ADV_63', 'ADV_63_Rank',
-            ]
-        
-        if self.binning_candidates is None:
-            # Default binning candidates (subset of base features)
-            # FIXED: Match actual column names from feature_engineering.py
-            self.binning_candidates = [
-                'Close%-21', 'Close%-63', 'Close%-126', 'Close%-252',
-                'Close_Mom21', 'Close_Mom63',
-                'Close_std21', 'Close_std63',
-                'Close_RSI14', 'Close_RSI21',
+                # Higher moments
+                'Close_skew63', 'Close_kurt63',
             ]
 
 
@@ -179,6 +194,9 @@ class ComputeConfig:
     n_jobs: int = 8                   # Parallel jobs for feature engineering
     verbose: bool = True              # Print progress messages
     parallelize_backtest: bool = False  # Parallelize walk-forward backtest
+    
+    # Data download parameters
+    batch_sleep: float = 1.0          # Sleep time (seconds) after every 20 downloads to avoid rate limiting
     
     # Persistence
     save_intermediate: bool = True    # Save intermediate objects
@@ -252,13 +270,15 @@ class ResearchConfig:
         assert 0 < self.portfolio.long_quantile < 1, "long_quantile must be in (0, 1)"
         assert 0 < self.portfolio.short_quantile < 1, "short_quantile must be in (0, 1)"
         assert self.portfolio.long_leverage >= 0, "long_leverage must be non-negative"
+        assert self.portfolio.short_notional >= 0, "short_notional must be non-negative"
+        assert 0 < self.portfolio.long_margin_req <= 1, "long_margin_req must be in (0, 1]"
+        assert 0 < self.portfolio.short_margin_req <= 1, "short_margin_req must be in (0, 1]"
         assert not (self.portfolio.long_only and self.portfolio.short_only), \
             "Cannot set both long_only and short_only to True"
         assert self.portfolio.cash_rate >= 0, "cash_rate must be non-negative"
         assert self.portfolio.commission_bps >= 0, "commission_bps must be non-negative"
         assert self.portfolio.slippage_bps >= 0, "slippage_bps must be non-negative"
         assert self.portfolio.borrow_cost >= 0, "borrow_cost must be non-negative"
-        assert 0 < self.portfolio.margin <= 1, "margin must be in (0, 1]"
         
         # Feature config
         assert self.features.ic_threshold >= 0, "ic_threshold must be non-negative"

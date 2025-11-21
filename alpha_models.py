@@ -460,11 +460,27 @@ def train_alpha_model(
     # ===== 2. Feature selection via IC =====
     print(f"[train] Computing ICs for feature selection...")
     
+    # ===== AUTO-DISCOVER base features if not specified =====
+    if config.features.base_features is None:
+        # Automatically use ALL features in panel (except metadata and targets)
+        # Exclude: Ticker (string), Close (price level), Date, FwdRet_* (targets), *_Rank (cross-sectional), *_Bin (will be created)
+        excluded_cols = {'Ticker', 'Close', 'Date'}
+        base_features = [
+            col for col in train_data.columns 
+            if col not in excluded_cols
+            and not col.startswith('FwdRet_')
+            and not col.endswith('_Rank')
+            and not col.endswith('_Bin')
+        ]
+        print(f"[train] Auto-discovered {len(base_features)} base features from panel")
+    else:
+        base_features = config.features.base_features
+    
     # Candidate features = base features + binned features
     candidate_features = []
     
     # Add base features that exist
-    for feat in config.features.base_features:
+    for feat in base_features:
         if feat in train_data.columns:
             candidate_features.append(feat)
     

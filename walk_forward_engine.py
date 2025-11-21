@@ -304,6 +304,7 @@ def run_walk_forward_backtest(
             regime_series = None
     
     results = []
+    diagnostics = []  # Store diagnostics for each rebalance period
     
     # Track previous weights for turnover calculation
     prev_long_weights = None
