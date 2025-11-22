@@ -630,19 +630,27 @@ def evaluate_portfolio_return(
     short_borrow_cost = 0.0
     margin_interest_cost = 0.0
     
+    # Apply zero_financing_mode if enabled (for diagnostic runs)
+    if config.portfolio.zero_financing_mode:
+        margin_interest_rate = 0.0
+        short_borrow_rate = 0.0
+    else:
+        margin_interest_rate = config.portfolio.margin_interest_rate
+        short_borrow_rate = config.portfolio.short_borrow_rate
+    
     # Margin interest for longs (borrow the unfunded portion)
     if gross_long > 0:
         # We post (margin_long × gross_long) as collateral
         # We borrow the rest: gross_long × (1 - margin_long)
         margin_long, _ = config.portfolio.get_active_margins()
         borrowed_long = gross_long * (1.0 - margin_long)
-        margin_interest_cost = (config.portfolio.margin_interest_rate * 
+        margin_interest_cost = (margin_interest_rate * 
                                borrowed_long * 
                                (config.time.HOLDING_PERIOD_DAYS / 365.0))
     
     # Short borrow fee (on full notional, not margin-adjusted)
     if gross_short > 0:
-        short_borrow_cost = (config.portfolio.short_borrow_rate * 
+        short_borrow_cost = (short_borrow_rate * 
                             gross_short * 
                             (config.time.HOLDING_PERIOD_DAYS / 365.0))
     

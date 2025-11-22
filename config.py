@@ -92,6 +92,12 @@ class PortfolioConfig:
     portfolio_margin_long: float = 0.15   # Typical for diversified ETF portfolio
     portfolio_margin_short: float = 0.15  # Typical for diversified ETF portfolio
     
+    # === Margin Utilization ===
+    # Fraction of available margin capacity to use
+    # 1.0 = fully margin-saturated (max gross under regime)
+    # 0.80 = use 80% of theoretical margin, keep 20% as cash collateral earning cash_rate
+    max_margin_utilization: float = 0.80
+    
     # === Dollar-Neutral Constraint ===
     enforce_dollar_neutral: bool = True   # True = long exposure = short exposure
     long_short_ratio: float = 1.0         # Only used if enforce_dollar_neutral=False
@@ -103,21 +109,27 @@ class PortfolioConfig:
     # Portfolio mode
     long_only: bool = False      # If True, only construct long positions (cash otherwise)
     short_only: bool = False     # If True, only construct short positions (cash otherwise)
-    cash_rate: float = 0.045     # Annual interest rate on cash positions (default 4.5%)
+    cash_rate: float = 0.034     # Annual interest rate on cash positions (3.4% - IBKR Pro rate)
     
     # Transaction costs (realistic estimates for ETF trading)
     # Note: "per side" means charged on EACH trade (buy, sell, short, cover)
     commission_bps: float = 3.0  # Commission in basis points per side (0-2 bps typical)
     slippage_bps: float = 5.0    # Slippage + market impact per side (5-10 bps for liquid ETFs)
     
-    # === Financing Costs (NEW - separate rates for shorts vs longs) ===
-    short_borrow_rate: float = 0.055      # Annual rate to borrow shares for shorting (5.5%)
+    # === Financing Costs (realistic rates for liquid ETF universe at IBKR) ===
+    short_borrow_rate: float = 0.01       # Annual rate to borrow shares for shorting (1.0%)
                                           # Paid on FULL notional of short positions
-    margin_interest_rate: float = 0.055   # Annual interest rate on cash borrowed for leverage (5.5%)
+                                          # Note: General collateral rate for liquid ETFs (not hard-to-borrow)
+    margin_interest_rate: float = 0.05    # Annual interest rate on cash borrowed for leverage (5.0%)
                                           # Paid on borrowed portion of long positions
     
     # DEPRECATED: Use short_borrow_rate and margin_interest_rate instead
     borrow_cost: float = 0.055    # DEPRECATED: Now split into separate rates above
+    
+    # === Diagnostic Mode ===
+    # If True, force zero financing costs for diagnostic runs (cash_rate still applies)
+    # Useful for isolating signal quality from financing drag
+    zero_financing_mode: bool = False
     
     # Risk limits (default caps)
     # NOTE: These are BASE caps - portfolio optimization will adaptively relax them
@@ -245,16 +257,25 @@ class PortfolioConfig:
         if self.enforce_dollar_neutral:
             # Dollar-neutral: leverage = 1 / (margin_long + margin_short)
             # This is a pure ratio, independent of capital
-            max_leverage = 1.0 / (margin_long + margin_short)
-            long_exp = max_leverage
-            short_exp = max_leverage
+            base_leverage = 1.0 / (margin_long + margin_short)
+            
+            # Scale by max_margin_utilization so we don't always use 100% of margin
+            # This leaves (1 - max_margin_utilization) in cash earning cash_rate
+            scaled_leverage = base_leverage * self.max_margin_utilization
+            
+            long_exp = scaled_leverage
+            short_exp = scaled_leverage
         else:
             # User-specified ratio (e.g., 130/30 fund)
             # Total capital constraint: margin_long * L + margin_short * S <= 1
             # With ratio constraint: L / S = long_short_ratio
             ratio = self.long_short_ratio
-            long_exp = ratio / (margin_long * ratio + margin_short)
-            short_exp = long_exp / ratio
+            base_long = ratio / (margin_long * ratio + margin_short)
+            base_short = base_long / ratio
+            
+            # Scale by max_margin_utilization
+            long_exp = base_long * self.max_margin_utilization
+            short_exp = base_short * self.max_margin_utilization
         
         return {
             'long_exposure': long_exp,
