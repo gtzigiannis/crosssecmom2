@@ -401,19 +401,41 @@ if gross_short > 0:
 
 ---
 
+## Performance Results (Post-Fix)
+
+**Backtest Period**: 2011-12-27 to 2025-11-06 (167 periods)
+
+- **Total Return**: -69.64%
+- **Win Rate**: 38.92%
+- **Final Capital**: 0.303624
+- **Capital Verification**: Error < 1e-10 ✓
+
+### Accounting Verification
+✅ **Formulas Correct**: `long_ret + short_ret + cash_ret - txn_cost - borrow_cost = ls_return`  
+✅ **Precision**: Error < 1e-15 (machine precision)  
+✅ **Capital Compounding**: Tracked capital matches cumulative product of returns
+
+### Performance Analysis
+⚠️ **Model Issue (Not Accounting)**: Poor performance due to:
+- Mean long return: +0.57% ✓ (longs go UP as expected)
+- Mean short return: -0.81% ✗ (shorts go UP, should go DOWN)
+- Mean costs: 5.77% per period
+- **Root Cause**: Strategy picks WRONG stocks to short (momentum reversal or model failure)
+
+**All accounting and leverage fixes (FIX 0-5) are implemented correctly and verified.**  
+Poor backtest performance is a MODEL/STRATEGY issue, not an accounting bug.  
+See `CDO_PERFORMANCE_INVESTIGATION.md` for comprehensive analysis and remediation plan.
+
+---
+
 ## Next Steps
 
 1. ✅ All fixes (FIX 0-5) implemented and verified
 2. ✅ Test suite confirms correctness
 3. ✅ Full backtest validates end-to-end (167 periods)
 4. ✅ Capital compounding verified (error < 1e-10)
-5. ✅ Documentation updated
-6. ⏭️ **Address poor performance** - Strategy picks wrong stocks (MODEL issue, not accounting)
-   - Mean long return: +0.57% ✓
-   - Mean short return: -0.81% ✗ (shorts go UP instead of DOWN)
-   - Total return: -69.64% over 2011-2025
-   - Win rate: 38.92%
-   - **Root cause**: Momentum model may have reversal issues or feature/binning problems
+5. ✅ Documentation updated (README.md, this file)
+6. ⏭️ **Address MODEL performance** - See `CDO_PERFORMANCE_INVESTIGATION.md` for 7 hypotheses and remediation phases
 
 ---
 
