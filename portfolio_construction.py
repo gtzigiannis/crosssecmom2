@@ -317,7 +317,7 @@ def _optimize_one_side(
         
         warnings.warn(
             f"[{side}] Adaptive caps: {n} positions, target={target_gross:.2f}, "
-            f"original sum_caps={sum_caps:.2f}. Relaxing by {scale_factor:.2f}x → "
+            f"original sum_caps={sum_caps:.2f}. Relaxing by {scale_factor:.2f}x -> "
             f"new range=[{per_etf_caps.min():.3f}, {per_etf_caps.max():.3f}]"
         )
     else:
@@ -685,7 +685,7 @@ def evaluate_portfolio_return(
     #   - Subtracted from account balance
     # 
     # VERIFICATION: 
-    #   total_capital_deployed = margin_posted + cash_balance = 1.0 ✓
+    #   total_capital_deployed = margin_posted + cash_balance = 1.0 [OK]
     #   net_financing = cash_interest - borrowing_costs
     #   final_capital = initial + asset_returns + net_financing - transaction_costs
     

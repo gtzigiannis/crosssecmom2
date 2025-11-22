@@ -416,7 +416,7 @@ def run_walk_forward_backtest(
                 current_regime = regime_series.get(t0, 'range')
                 mode = get_portfolio_mode_for_regime(current_regime)
                 if verbose_inner:
-                    print(f"[regime] Current regime: {current_regime} → mode: {mode}")
+                    print(f"[regime] Current regime: {current_regime} -> mode: {mode}")
             else:
                 mode = 'ls'
                 current_regime = 'none'
@@ -703,7 +703,7 @@ def run_walk_forward_backtest(
                 current_regime = regime_series.get(t0, 'range')  # Default to range if not found
                 mode = get_portfolio_mode_for_regime(current_regime)
                 if verbose:
-                    print(f"[regime] Current regime: {current_regime} → mode: {mode}")
+                    print(f"[regime] Current regime: {current_regime} -> mode: {mode}")
             else:
                 mode = 'ls'  # Default long/short mode
             
@@ -833,7 +833,7 @@ def run_walk_forward_backtest(
             if capital_error > 1e-6:
                 print(f"[WARN] Capital tracking mismatch detected!")
             else:
-                print(f"[OK] Capital tracking is consistent ✓")
+                print(f"[OK] Capital tracking is consistent [OK]")
     
     if verbose:
         print("\n" + "="*80)
@@ -921,6 +921,7 @@ def run_walk_forward_backtest(
 
 def bootstrap_performance_stats(
     returns: pd.Series,
+    config: ResearchConfig,
     n_bootstrap: int = 1000,
     block_size: int = 6,
     random_state: int = 42
@@ -986,7 +987,11 @@ def bootstrap_performance_stats(
         return_dist.append(boot_mean)
         
         if boot_std > 0:
-            sharpe = boot_mean / boot_std
+            # Sharpe ratio with risk-free rate
+            periods_per_year = 252 / config.time.HOLDING_PERIOD_DAYS
+            rf_per_period = config.portfolio.cash_rate / periods_per_year
+            excess_return = boot_mean - rf_per_period
+            sharpe = excess_return / boot_std
             sharpe_dist.append(sharpe)
     
     # Compute confidence intervals
@@ -1035,13 +1040,20 @@ def attribution_analysis(
     attribution = {}
     
     # ===== 1. Long/Short Attribution (already available) =====
+    # Calculate Sharpe with risk-free rate
+    periods_per_year = 252 / config.time.HOLDING_PERIOD_DAYS
+    rf_per_period = config.portfolio.cash_rate / periods_per_year
+    
+    long_excess = results_df['long_ret'].mean() - rf_per_period
+    short_excess = results_df['short_ret'].mean() - rf_per_period
+    
     attribution['long_short'] = {
         'long_mean': results_df['long_ret'].mean(),
         'short_mean': results_df['short_ret'].mean(),
         'long_std': results_df['long_ret'].std(),
         'short_std': results_df['short_ret'].std(),
-        'long_sharpe': results_df['long_ret'].mean() / results_df['long_ret'].std() if results_df['long_ret'].std() > 0 else 0,
-        'short_sharpe': results_df['short_ret'].mean() / results_df['short_ret'].std() if results_df['short_ret'].std() > 0 else 0,
+        'long_sharpe': long_excess / results_df['long_ret'].std() if results_df['long_ret'].std() > 0 else 0,
+        'short_sharpe': short_excess / results_df['short_ret'].std() if results_df['short_ret'].std() > 0 else 0,
     }
     
     # ===== 2. Regime Attribution =====
@@ -1233,10 +1245,15 @@ def analyze_performance(results_df: pd.DataFrame, config: ResearchConfig) -> Dic
     # Return statistics (returns are now in decimal form)
     mean_ret = returns.mean()
     std_ret = returns.std()
-    sharpe = mean_ret / std_ret if std_ret > 0 else 0.0
+    
+    # Sharpe ratio: (return - risk_free_rate) / volatility
+    # Risk-free rate from config (annual) needs to be converted to per-period
+    periods_per_year = 252 / config.time.HOLDING_PERIOD_DAYS
+    risk_free_per_period = config.portfolio.cash_rate / periods_per_year
+    excess_return = mean_ret - risk_free_per_period
+    sharpe = excess_return / std_ret if std_ret > 0 else 0.0
     
     # Annualization
-    periods_per_year = 252 / config.time.HOLDING_PERIOD_DAYS
     annual_return = mean_ret * periods_per_year
     annual_vol = std_ret * np.sqrt(periods_per_year)
     annual_sharpe = sharpe * np.sqrt(periods_per_year)
@@ -1257,6 +1274,7 @@ def analyze_performance(results_df: pd.DataFrame, config: ResearchConfig) -> Dic
     # Bootstrap confidence intervals
     bootstrap_stats = bootstrap_performance_stats(
         returns,
+        config,
         n_bootstrap=1000,
         block_size=6,
         random_state=config.features.random_state if hasattr(config.features, 'random_state') else 42

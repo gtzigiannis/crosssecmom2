@@ -203,8 +203,8 @@ class SupervisedBinnedModel(AlphaModel):
         if self.feature_weights is not None:
             # Weighted combination with IC sign handling
             # CRITICAL: IC sign determines ranking direction
-            #   Positive IC: high feature → rank high → good (normal)
-            #   Negative IC: high feature → rank low → bad (flip by using negative weight)
+            #   Positive IC: high feature -> rank high -> good (normal)
+            #   Negative IC: high feature -> rank low -> bad (flip by using negative weight)
             scores = pd.Series(0.0, index=cross_section.index)
             for feat in available_features:
                 # Always rank ascending (0 to 1)
@@ -352,7 +352,8 @@ def compute_cv_ic(
     feature_values: pd.Series,
     target_values: pd.Series,
     config,
-    n_splits: int = 5
+    n_splits: int = 5,
+    is_already_binned: bool = False
 ) -> float:
     """
     Compute cross-validated IC to prevent overfitting in feature selection.
@@ -378,6 +379,8 @@ def compute_cv_ic(
         Configuration for binning parameters
     n_splits : int
         Number of CV folds (default 5)
+    is_already_binned : bool
+        If True, feature is already binned, skip re-binning in CV
         
     Returns
     -------
@@ -398,7 +401,22 @@ def compute_cv_ic(
             method='spearman'
         )
     
-    # K-Fold cross-validation
+    # If feature is already binned, just compute IC directly without re-binning
+    if is_already_binned:
+        kf = KFold(n_splits=n_splits, shuffle=False)
+        fold_ics = []
+        for train_idx, test_idx in kf.split(X):
+            X_test = X[test_idx]
+            y_test = y[test_idx]
+            ic = compute_ic(
+                pd.Series(X_test),
+                pd.Series(y_test),
+                method='spearman'
+            )
+            fold_ics.append(ic)
+        return np.mean(fold_ics)
+    
+    # K-Fold cross-validation with binning
     kf = KFold(n_splits=n_splits, shuffle=False)  # No shuffle to preserve time order
     fold_ics = []
     
@@ -536,7 +554,25 @@ def train_alpha_model(
     
     binning_dict = {}
     
-    for feat in config.features.binning_candidates:
+    # Determine which features to bin
+    if config.features.use_manual_binning_candidates:
+        # Manual mode: Use hardcoded list
+        features_to_bin = config.features.binning_candidates
+        print(f"[train] Manual binning mode: Using {len(features_to_bin)} specified features")
+    else:
+        # Auto mode: Bin ALL base features (except metadata/targets)
+        # Use same logic as base_features discovery
+        excluded_cols = {'Ticker', 'Close', 'Date'}
+        features_to_bin = [
+            col for col in train_data.columns 
+            if col not in excluded_cols
+            and not col.startswith('FwdRet_')
+            and not col.endswith('_Rank')
+            and not col.endswith('_Bin')
+        ]
+        print(f"[train] Auto binning mode: Binning ALL {len(features_to_bin)} base features")
+    
+    for feat in features_to_bin:
         if feat not in train_data.columns:
             continue
         
@@ -577,7 +613,7 @@ def train_alpha_model(
     else:
         base_features = config.features.base_features
     
-    # Candidate features = base features only (binned features will be evaluated via CV)
+    # Candidate features = base features + binned features (all compete for selection)
     candidate_features = []
     
     # Add base features that exist
@@ -585,17 +621,27 @@ def train_alpha_model(
         if feat in train_data.columns:
             candidate_features.append(feat)
     
+    # Add binned features that were created
+    for feat in binning_dict.keys():
+        binned_name = f'{feat}_Bin'
+        if binned_name in train_data.columns:
+            candidate_features.append(binned_name)
+    
+    print(f"[train] Evaluating {len(candidate_features)} candidate features ({len(base_features)} raw + {len(binning_dict)} binned)")
+    
     # Compute CV-IC for each candidate (includes binning in CV loop)
     # PARALLELIZED: Compute CV-ICs in parallel across features
     from joblib import Parallel, delayed
     
     def compute_single_cv_ic(feat, train_data, target_col, config):
         """Helper function for parallel CV-IC computation."""
+        is_binned = feat.endswith('_Bin')
         cv_ic = compute_cv_ic(
             train_data[feat],
             train_data[target_col],
             config,
-            n_splits=5
+            n_splits=5,
+            is_already_binned=is_binned
         )
         return feat, cv_ic
     
@@ -624,31 +670,25 @@ def train_alpha_model(
     print(f"[train] Selected {len(selected_features)} features by CV-IC")
     print(f"[train] Top 5 by |CV-IC|: {abs_cv_ic[selected_features].nlargest(5).to_dict()}")
     
-    # Now create binned versions of selected features on FULL training data
-    # Only use binned version if base feature was already binned
-    final_features = []
-    for feat in selected_features:
-        if feat in binning_dict:
-            # Feature was binned, use binned version
-            binned_name = f'{feat}_Bin'
-            if binned_name in train_data.columns:
-                final_features.append(binned_name)
-        else:
-            # Feature was not binned, use raw version
-            final_features.append(feat)
+    # DEBUG: Show how many raw vs binned features were selected
+    raw_selected = [f for f in selected_features if not f.endswith('_Bin')]
+    binned_selected = [f for f in selected_features if f.endswith('_Bin')]
+    print(f"[train] Breakdown: {len(raw_selected)} raw + {len(binned_selected)} binned features selected")
+    
+    # DEBUG: Show IC range
+    if len(selected_features) > 0:
+        ic_values = cv_ic_series[selected_features]
+        print(f"[train] IC range: [{ic_values.min():.4f}, {ic_values.max():.4f}]")
+    
+    # Selected features already include raw and/or binned versions based on their IC
+    # No need to swap - use selected features directly
+    final_features = selected_features
     
     # ===== 3. Feature weights (CV-IC-weighted combination) =====
     # CRITICAL: Store SIGNED IC values to preserve direction
-    # Positive IC: high feature values → high returns (rank ascending)
-    # Negative IC: high feature values → low returns (rank descending / flip sign)
-    # Map weights from selected_features to final_features
-    feature_weights_dict = {}
-    for i, feat in enumerate(selected_features):
-        final_feat = final_features[i]
-        # Store SIGNED IC (not absolute value!)
-        feature_weights_dict[final_feat] = cv_ic_series[feat]
-    
-    feature_weights = pd.Series(feature_weights_dict)
+    # Positive IC: high feature values -> high returns (rank ascending)
+    # Negative IC: high feature values -> low returns (rank descending / flip sign)
+    feature_weights = cv_ic_series[final_features].copy()
     # Normalize by absolute values (preserve sign)
     feature_weights = feature_weights / abs(feature_weights).sum()
     

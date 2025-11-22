@@ -189,12 +189,12 @@ class CrossSecMomDataManager:
                             print(f"  [WARNING] {ticker}: Invalid data format")
                     else:
                         print(f"  [WARNING] {ticker}: No data available")
-                        print(f"             → Check if {ticker} has historical data back to {start_date}")
-                        print(f"             → Consider alternative ETF if ticker is delisted or too recent")
+                        print(f"             -> Check if {ticker} has historical data back to {start_date}")
+                        print(f"             -> Consider alternative ETF if ticker is delisted or too recent")
 
                 except Exception as e:
                     print(f"  [ERROR] {ticker}: {e}")
-                    print(f"         → Verify {ticker} exists and has data back to {start_date}")
+                    print(f"         -> Verify {ticker} exists and has data back to {start_date}")
 
         # Forward update: Download new dates for existing tickers
         if needs_forward_update and existing_tickers:
@@ -480,12 +480,12 @@ class CrossSecMomDataManager:
                         print(f"  [OK] Saved {name} data to {data_path}")
                     else:
                         print(f"  [WARNING] {name}: No data downloaded from {ticker}")
-                        print(f"             → Verify macro ticker {ticker} exists and has data back to {start_date}")
+                        print(f"             -> Verify macro ticker {ticker} exists and has data back to {start_date}")
                         data_series = pd.Series(dtype=float)
 
                 except Exception as e:
                     print(f"  [ERROR] Could not download {name} ({ticker}): {e}")
-                    print(f"         → Check if macro ticker {ticker} is correct and has historical data back to {start_date}")
+                    print(f"         -> Check if macro ticker {ticker} is correct and has historical data back to {start_date}")
                     data_series = pd.Series(dtype=float)
 
             # Filter to requested range and convert yields

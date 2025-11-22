@@ -303,9 +303,9 @@ class FeatureConfig:
     # NOTE: If None, will auto-discover ALL features from panel data
     base_features: List[str] = None
     
-    # Binning candidates (subset of base features for supervised binning)
-    # NOTE: These features get binned to create additional '_Bin' features
-    binning_candidates: List[str] = None
+    # Binning control
+    use_manual_binning_candidates: bool = False  # If True, use hardcoded binning_candidates; if False, bin ALL features
+    binning_candidates: List[str] = None         # Manual list of features to bin (only used if use_manual_binning_candidates=True)
     
     # Feature selection
     ic_threshold: float = 0.02        # Minimum absolute IC for feature selection
@@ -324,7 +324,8 @@ class FeatureConfig:
         # It will be dynamically populated from panel data in alpha_models.py
         # This ensures ALL generated features are automatically included as candidates
         
-        if self.binning_candidates is None:
+        # Only set default binning_candidates if manual mode is enabled and list is None
+        if self.use_manual_binning_candidates and self.binning_candidates is None:
             # Expanded binning candidates to include diverse feature types
             # These will be binned to create supervised features
             self.binning_candidates = [
