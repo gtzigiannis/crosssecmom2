@@ -369,9 +369,9 @@ def build_universe_metadata(
     returns_df: Optional[pd.DataFrame] = None,
     dup_corr_threshold: float = 0.99,
     max_within_cluster_corr: float = 0.85,
-    default_cluster_cap: float = 0.10,
-    default_per_etf_cap: float = 0.05,
-    high_risk_cluster_cap: float = 0.07,
+    default_cluster_cap: float = 0.30,  # 30% to accommodate 3.64x leverage (1.82 per side)
+    default_per_etf_cap: float = 0.25,  # 25% to accommodate 1.82/8 = 22.75% with only 8 positions
+    high_risk_cluster_cap: float = 0.20,  # 20% for risky themes
     high_risk_families: Optional[Set[str]] = None,
 ) -> Tuple[pd.DataFrame, pd.Series]:
     """

@@ -20,6 +20,7 @@ import time
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import logging
 
 
 class CrossSecMomDataManager:
@@ -49,6 +50,9 @@ class CrossSecMomDataManager:
         
         self.macro_dir = self.data_dir / "macro"
         self.macro_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Suppress yfinance's verbose error messages
+        logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 
     def load_or_download_etf_prices(
         self,
@@ -121,8 +125,8 @@ class CrossSecMomDataManager:
             last_date_str = latest_date.strftime("%Y-%m-%d")
             first_date_str = earliest_date.strftime("%Y-%m-%d")
 
-            today = dt.date.today().isoformat()
-            needs_forward_update = last_date_str < end_date and last_date_str < today
+            # Check if we need to update: existing data doesn't cover requested end_date
+            needs_forward_update = last_date_str < end_date
             needs_backfill = start_date < first_date_str
 
             print(f"[DataManager] Existing data: {len(existing_tickers)} ETFs, dates: {first_date_str} to {last_date_str}")
@@ -195,52 +199,64 @@ class CrossSecMomDataManager:
         # Forward update: Download new dates for existing tickers
         if needs_forward_update and existing_tickers:
             update_start = (latest_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            print(f"[DataManager] Updating existing ETFs from {update_start} to {end_date}...")
-
-            for ticker in existing_tickers:
-                try:
-                    df = yf.download(
-                        ticker,
-                        start=update_start,
-                        end=end_date,
-                        progress=False,
-                        auto_adjust=True
-                    )
-
-                    if not df.empty and 'Close' in df.columns:
-                        # Ensure timezone-naive
-                        if df.index.tz is not None:
-                            df.index = df.index.tz_localize(None)
-
-                        # Handle MultiIndex columns from yfinance
-                        if isinstance(df.columns, pd.MultiIndex):
-                            new_series = df['Close'].iloc[:, 0]
-                        else:
-                            new_series = df['Close']
-                        
-                        if isinstance(new_series, pd.Series) and len(new_series) > 0:
-                            # Merge with existing data
-                            existing_series = existing_data[ticker]
-                            combined = pd.concat([existing_series, new_series]).sort_index()
-                            combined = combined[~combined.index.duplicated(keep='last')]
-
-                            downloaded_data[ticker] = combined
-
-                            # Save updated CSV
-                            csv_path = self.data_dir / f"{ticker}.csv"
-                            pd.DataFrame({'close': combined}).to_csv(csv_path)
-                            print(f"  [OK] {ticker}: +{len(new_series)} new days")
-                        else:
-                            # No valid new data, keep existing
-                            downloaded_data[ticker] = existing_data[ticker]
-                    else:
-                        # No new data, keep existing
+            
+            # Check if the date range is too small (less than 7 calendar days)
+            # yfinance has issues with very small ranges, especially over weekends
+            # A week ensures at least a few trading days even with holidays
+            date_diff = (pd.to_datetime(end_date) - pd.to_datetime(update_start)).days
+            if date_diff < 7:
+                print(f"[DataManager] Update range too small ({date_diff} days, need >=7). Skipping forward update.")
+                # Use existing data
+                for ticker in existing_tickers:
+                    if ticker not in downloaded_data:
                         downloaded_data[ticker] = existing_data[ticker]
+            else:
+                print(f"[DataManager] Updating existing ETFs from {update_start} to {end_date}...")
 
-                except Exception as e:
-                    print(f"  [ERROR] {ticker}: {e}")
-                    # Keep existing data on error
-                    downloaded_data[ticker] = existing_data[ticker]
+                for ticker in existing_tickers:
+                    try:
+                        df = yf.download(
+                            ticker,
+                            start=update_start,
+                            end=end_date,
+                            progress=False,
+                            auto_adjust=True
+                        )
+
+                        if not df.empty and 'Close' in df.columns:
+                            # Ensure timezone-naive
+                            if df.index.tz is not None:
+                                df.index = df.index.tz_localize(None)
+
+                            # Handle MultiIndex columns from yfinance
+                            if isinstance(df.columns, pd.MultiIndex):
+                                new_series = df['Close'].iloc[:, 0]
+                            else:
+                                new_series = df['Close']
+                            
+                            if isinstance(new_series, pd.Series) and len(new_series) > 0:
+                                # Merge with existing data
+                                existing_series = existing_data[ticker]
+                                combined = pd.concat([existing_series, new_series]).sort_index()
+                                combined = combined[~combined.index.duplicated(keep='last')]
+
+                                downloaded_data[ticker] = combined
+
+                                # Save updated CSV
+                                csv_path = self.data_dir / f"{ticker}.csv"
+                                pd.DataFrame({'close': combined}).to_csv(csv_path)
+                                print(f"  [OK] {ticker}: +{len(new_series)} new days")
+                            else:
+                                # No valid new data, keep existing
+                                downloaded_data[ticker] = existing_data[ticker]
+                        else:
+                            # No new data, keep existing
+                            downloaded_data[ticker] = existing_data[ticker]
+
+                    except Exception as e:
+                        print(f"  [ERROR] {ticker}: {e}")
+                        # Keep existing data on error
+                        downloaded_data[ticker] = existing_data[ticker]
 
         # Backfill: Download earlier dates for existing tickers
         if needs_backfill and existing_tickers:

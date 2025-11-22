@@ -1,8 +1,8 @@
 # Cross-Sectional Momentum Strategy (crosssecmom2)
 
-> **Last Updated**: December 19, 2024  
-> **Status**: Production-Ready with Full Cost Modeling, Regime Switching & Enhanced Features  
-> **Strategy Type**: Cross-Sectional Momentum on 116 ETFs (2015-2025)
+> **Last Updated**: November 22, 2025  
+> **Status**: Production-Ready with Adaptive Portfolio Optimization & Parallelization  
+> **Strategy Type**: Cross-Sectional Momentum on 116 ETFs (2017-2025)
 
 ---
 
@@ -37,13 +37,13 @@
 
 ✅ **No Look-Ahead Bias**: Training, binning, and feature selection use only historical data  
 ✅ **Realistic Cost Modeling**: Transaction costs (commission + slippage) and borrowing costs  
-✅ **Margin-Constrained Shorts**: Proper modeling of leverage limits (50% margin = 50% max short)  
+✅ **Adaptive Constraints**: Portfolio optimization automatically scales caps to ensure feasibility  
+✅ **Parallelized Execution**: Feature engineering, selection, and walk-forward backtesting run in parallel  
+✅ **Margin-Constrained**: Proper modeling of leverage limits via margin regime settings  
 ✅ **Universe Management**: Handles ETF families, duplicates, theme clustering, caps  
-✅ **Enhanced Feature Set**: 96 features including drawdowns, shocks, relative returns, correlations, asset flags, and macro/regime indicators
-✅ **Multiple Modes**: Standard long/short, long-only, short-only, regime-based switching  
-✅ **Regime Awareness**: Optional market regime detection for adaptive portfolio construction  
-✅ **Reproducible**: Fixed random state for deterministic results  
-✅ **Production-Ready**: Comprehensive testing, diagnostics, and validation
+✅ **Enhanced Feature Set**: 93 features including momentum, volatility, drawdowns, correlations, macro indicators  
+✅ **Production-Ready**: Comprehensive testing, diagnostics, and validation  
+✅ **CVXPY Optimization**: Mandatory constraint-based portfolio optimization with ECOS solver
 
 ---
 
@@ -59,8 +59,7 @@ pip install -r requirements.txt
 - pandas>=1.5.0, numpy>=1.23.0, yfinance>=0.2.0
 - scikit-learn>=1.2.0, scipy>=1.10.0, joblib>=1.2.0
 - pyarrow>=10.0.0, numba>=0.56.0
-
-**Optional**: cvxpy>=1.3.0 (for optimal portfolio construction with exact cap enforcement)
+- **cvxpy>=1.3.0** (mandatory - ECOS solver for portfolio optimization)
 
 ### 2. Prepare Data
 
@@ -198,6 +197,45 @@ See `config.py` for complete parameter list and validation rules.
 
 ---
 
+## Recent Updates (November 2025)
+
+### Accounting & Leverage Fixes
+
+**Status**: ✅ All critical fixes implemented and validated
+
+1. **Fixed Leverage Semantics**: Leverage ratios are now constant (1.82x/1.82x long/short for reg_t_maintenance) regardless of capital value
+2. **Mandatory CVXPY**: Portfolio optimization requires cvxpy with ECOS solver for constraint enforcement
+3. **Adaptive Portfolio Constraints**: System automatically scales per-ETF and cluster caps when fixed caps are insufficient
+4. **Parallelization**: Feature engineering, feature selection, and walk-forward backtesting fully parallelized (19.5x speedup)
+5. **Robust Error Handling**: Constant feature detection, proper timing variable initialization
+
+### Adaptive Constraint System
+
+The portfolio optimization now includes adaptive cap logic that automatically ensures feasibility:
+
+```python
+# If configured caps are insufficient for target exposure:
+if sum(per_etf_caps) < target_gross * 0.99:
+    scale_factor = (target_gross * 1.1) / sum(per_etf_caps)
+    per_etf_caps *= scale_factor
+```
+
+**Benefits**:
+- Works with ANY universe size (5-500 ETFs)
+- Works with ANY leverage setting (1-10x)
+- Works with ANY quantile selection
+- Mathematically guarantees optimization feasibility
+- Transparent warnings when caps are relaxed
+
+### Performance Improvements
+
+- **Backtest Speed**: 13 minutes → 40 seconds (19.5x faster)
+- **Feature Engineering**: Parallelized with threading backend (32 workers)
+- **Walk-Forward**: Parallelized with loky backend across all periods
+- **Feature Selection**: Parallelized IC computation for 93 features
+
+---
+
 ## Accounting and Leverage Fixes (November 2025)
 
 **Status**: ✅ All fixes (FIX 0-5) implemented and verified
@@ -260,9 +298,11 @@ Three options via `margin_regime` parameter:
 
 **Max leverage formula** (dollar-neutral):
 ```python
-max_position = capital / (margin_long + margin_short)
+max_leverage_per_side = 1.0 / (margin_long + margin_short)
 # Example: 1.0 / (0.25 + 0.30) = 1.82 each side = 3.64x gross
 ```
+
+**Key Property**: Leverage ratios are CONSTANT regardless of capital value. They represent pure multipliers, not dollar amounts.
 
 ### Cash Ledger
 
@@ -279,29 +319,7 @@ Automatic verification: `margin_posted + cash_balance = 1.0` ✓
 
 ## Portfolio Construction
 
-### Two Methods
-
-#### 1. Simple Method (Fast)
-
-
-```python
-long_weights, short_weights = construct_portfolio_simple(
-    scores=scores,
-    universe_metadata=metadata,
-    config=config,
-    enforce_caps=True
-)
-```
-
-**Algorithm**:
-1. Select top/bottom quantiles
-2. Equal-weight within each side
-3. Scale to enforce caps (approximate)
-
-**Pros**: Very fast, no optimization required  
-**Cons**: Cap enforcement is approximate (scales globally)
-
-#### 2. CVXPY Method (Optimal)
+### CVXPY Optimization (Required)
 
 ```python
 long_weights, short_weights = construct_portfolio_cvxpy(
@@ -317,27 +335,34 @@ maximize: Σ(score_i × weight_i)
 subject to:
   |w_i| ≤ per_etf_cap_i                    (individual caps)
   Σ_{i ∈ cluster_k} |w_i| ≤ cluster_cap_k  (cluster caps)
-  Σ(long) = 1.0                             (full long deployment)
-  Σ|short| = margin                         (margin constraint)
+  Σ(long) = target_long                    (long exposure from margin)
+  Σ|short| = target_short                  (short exposure from margin)
 ```
 
-**Pros**: Exact cap enforcement, optimal allocation  
-**Cons**: Requires cvxpy installation, slower
+**Adaptive Cap Logic**: If configured caps are insufficient for target exposures, the system automatically scales them proportionally with a 10% buffer to ensure feasibility. This makes the strategy robust to any universe size or leverage setting.
+
+**Solver**: Uses ECOS solver from cvxpy (mandatory dependency).
 
 ### Caps System
 
-**Per-ETF Caps**: Max weight per ticker (default 5%)
+**Per-ETF Caps**: Max weight per ticker (default 10%, adaptively relaxed if needed)
 
-**Cluster Caps**: Max weight per theme cluster (default 10%)
+**Cluster Caps**: Max weight per theme cluster (default 15%, adaptively relaxed if needed)
+
+**Adaptive Logic**: When the sum of configured caps is less than the target exposure needed, the system automatically scales all caps proportionally to ensure optimization feasibility.
 
 **Example**:
 ```
-Cluster: EQ_US_LARGECAP (SPY, IVV, VOO)
-- All are highly correlated (duplicates)
-- Cluster cap = 10%
-- Per-ETF cap = 5%
-- Result: Max 2 of these ETFs can be held (2 × 5% = 10%)
+Universe: 8 ETFs selected
+Target exposure: 1.82 (from 3.64x gross leverage / 2 sides)
+Configured caps: 8 × 0.10 = 0.80 total capacity
+Problem: 0.80 < 1.82 (infeasible!)
+
+Solution: Scale caps by (1.82 × 1.1) / 0.80 = 2.50x
+New caps: 8 × 0.25 = 2.00 (sufficient with buffer)
 ```
+
+This ensures the strategy works with any universe size, leverage setting, or quantile selection.
 
 ### Long-Only and Short-Only Modes
 
@@ -404,12 +429,14 @@ results = run_walk_forward_backtest(
 )
 ```
 
-**Per-Period Process**:
+**Per-Period Process** (parallelized across all periods):
 1. Train model on 5 years ending 22 days before t0
 2. Score universe at t0 using trained model
-3. Construct portfolio (top/bottom quantiles)
+3. Construct portfolio (top/bottom quantiles with adaptive caps)
 4. Evaluate returns + costs over 21-day hold
 5. Step forward 21 days
+
+**Parallelization**: All periods run in parallel using joblib's loky backend, resulting in 19.5x speedup (13 minutes → 40 seconds for 47 periods).
 
 **Results DataFrame**: `date`, `ls_return`, `long_ret`, `short_ret`, `txn_cost`, `borrow_cost`, `n_long`, `n_short`, `long_tickers`, `short_tickers`, `cash_ledger`
 
@@ -465,28 +492,8 @@ print(f"Clusters: {metadata['cluster_id'].nunique()}")
 - **"Insufficient training data"**: Reduce `TRAINING_WINDOW_DAYS` or use earlier `START_DATE`
 - **"No features passed IC threshold"**: Lower `ic_threshold` or add more candidates
 - **"Borrowing cost seems wrong"**: Cost = rate × full_notional × days/365 (not margin-adjusted)
-- **"Cap violations"**: Use CVXPY method (`pip install cvxpy`) for exact enforcement
-
----
-
-
-results = run_walk_forward_backtest(
-    ...,
-    portfolio_method='cvxpy'  # Instead of 'simple'
-)
-```
-
-### Issue 5: "Short positions are 100% when margin is 50%"
-
-**Symptom**: Gross short exposure not limited by margin
-
-**Status**: FIXED ✅
-
-**Verification**:
-```python
-# Test that margin correctly limits shorts
-python TEST_ADVANCED_FIXES.py  # See test_margin_limits_short_exposure()
-```
+- **"ModuleNotFoundError: cvxpy"**: Install cvxpy (`pip install cvxpy`) - it's mandatory
+- **"Optimization infeasible"**: Check adaptive cap warnings - system should auto-fix this
 
 ---
 

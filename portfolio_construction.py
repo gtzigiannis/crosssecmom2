@@ -14,13 +14,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Tuple, Optional
 import warnings
-
-try:
-    import cvxpy as cp
-    CVXPY_AVAILABLE = True
-except ImportError:
-    CVXPY_AVAILABLE = False
-    warnings.warn("cvxpy not available, falling back to simple capping")
+import cvxpy as cp
 
 
 def construct_portfolio_simple(
@@ -28,12 +22,12 @@ def construct_portfolio_simple(
     universe_metadata: pd.DataFrame,
     config,
     enforce_caps: bool = False,
-    mode: str = 'ls',
-    capital: float = 1.0
+    mode: str = 'ls'
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Simple portfolio construction: top/bottom quantiles with equal weights.
     
+    Returns weights as leverage multipliers (dimensionless, relative to equity).
     Optionally enforces caps via simple scaling (not optimal, but fast).
     Supports multiple portfolio modes via mode parameter.
     
@@ -57,7 +51,7 @@ def construct_portfolio_simple(
     Returns
     -------
     tuple of (pd.Series, pd.Series)
-        (long_weights, short_weights) indexed by ticker
+        (long_weights, short_weights) as leverage multipliers (dimensionless)
     """
     # Handle cash mode (no positions)
     if mode == 'cash':
@@ -79,8 +73,8 @@ def construct_portfolio_simple(
     long_tickers = sorted_scores.head(n_long).index
     short_tickers = sorted_scores.tail(n_short).index
     
-    # FIX 1 & FIX 5: Use margin regime for exposure targets scaled by capital
-    max_exposure = config.portfolio.compute_max_exposure(capital=capital)
+    # Get target leverage from margin regime (dimensionless ratios)
+    max_exposure = config.portfolio.compute_max_exposure(capital=1.0)
     long_target_gross = max_exposure['long_exposure']
     short_target_gross = max_exposure['short_exposure']
     
@@ -150,11 +144,12 @@ def construct_portfolio_cvxpy(
     scores: pd.Series,
     universe_metadata: pd.DataFrame,
     config,
-    mode: str = 'ls',
-    capital: float = 1.0
+    mode: str = 'ls'
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Portfolio construction with CVXPY optimization to enforce caps exactly.
+    
+    Returns weights as leverage multipliers (dimensionless, relative to equity).
     
     Formulation:
     - Maximize: sum of (score_i * weight_i) for long + short sides
@@ -162,8 +157,8 @@ def construct_portfolio_cvxpy(
       * w_i >= 0 for long, w_i <= 0 for short
       * |w_i| <= per_etf_cap_i
       * sum_{i in cluster_k} |w_i| <= cluster_cap_k
-      * sum(long_weights) = target_long_gross (e.g., 1.0)
-      * sum(abs(short_weights)) = target_short_gross (e.g., 1.0)
+      * sum(long_weights) = target_long_gross (leverage ratio)
+      * sum(abs(short_weights)) = target_short_gross (leverage ratio)
     
     Parameters
     ----------
@@ -179,12 +174,8 @@ def construct_portfolio_cvxpy(
     Returns
     -------
     tuple of (pd.Series, pd.Series)
-        (long_weights, short_weights) indexed by ticker
+        (long_weights, short_weights) as leverage multipliers (dimensionless)
     """
-    if not CVXPY_AVAILABLE:
-        warnings.warn("CVXPY not available, using simple construction")
-        return construct_portfolio_simple(scores, universe_metadata, config, enforce_caps=True, mode=mode)
-    
     # Handle cash mode
     if mode == 'cash':
         return pd.Series(dtype=float), pd.Series(dtype=float)
@@ -207,8 +198,8 @@ def construct_portfolio_cvxpy(
     long_tickers = sorted_scores.head(n_long).index.tolist()
     short_tickers = sorted_scores.tail(n_short).index.tolist()
     
-    # FIX 1 & FIX 5: Use margin regime scaled by capital
-    max_exposure = config.portfolio.compute_max_exposure(capital=capital)
+    # Get target leverage from margin regime (dimensionless ratios)
+    max_exposure = config.portfolio.compute_max_exposure(capital=1.0)
     long_target_gross = max_exposure['long_exposure']
     short_target_gross = max_exposure['short_exposure']
     
@@ -314,34 +305,70 @@ def _optimize_one_side(
         cp.sum(w) == target_gross,  # Target gross exposure
     ]
     
-    # Per-ETF caps
-    per_etf_caps = metadata['per_etf_cap'].values
+    # ADAPTIVE PER-ETF CAPS: Ensure feasibility for any universe size
+    # If sum of caps < target, relax caps proportionally
+    per_etf_caps_config = metadata['per_etf_cap'].values
+    sum_caps = per_etf_caps_config.sum()
+    
+    if sum_caps < target_gross * 0.99:  # Insufficient capacity
+        # Relax caps proportionally with 10% buffer
+        scale_factor = (target_gross * 1.1) / sum_caps
+        per_etf_caps = per_etf_caps_config * scale_factor
+        
+        warnings.warn(
+            f"[{side}] Adaptive caps: {n} positions, target={target_gross:.2f}, "
+            f"original sum_caps={sum_caps:.2f}. Relaxing by {scale_factor:.2f}x → "
+            f"new range=[{per_etf_caps.min():.3f}, {per_etf_caps.max():.3f}]"
+        )
+    else:
+        per_etf_caps = per_etf_caps_config
+    
     constraints.append(w <= per_etf_caps)
     
-    # Per-cluster caps
+    # ADAPTIVE CLUSTER CAPS: Similar logic for clusters
     cluster_ids = metadata['cluster_id'].values
-    unique_clusters = np.unique(cluster_ids[~np.isnan(cluster_ids)])
+    unique_clusters = [c for c in np.unique(cluster_ids) if pd.notna(c)]
     
-    for cid in unique_clusters:
-        cluster_mask = (cluster_ids == cid)
-        cluster_cap = metadata.loc[cluster_mask, 'cluster_cap'].iloc[0]
-        constraints.append(cp.sum(w[cluster_mask]) <= cluster_cap)
+    if len(unique_clusters) > 0:
+        cluster_cap_dict = {}
+        total_cluster_capacity = 0.0
+        
+        for cid in unique_clusters:
+            cluster_mask = (cluster_ids == cid)
+            cluster_cap_config = metadata.loc[cluster_mask, 'cluster_cap'].iloc[0]
+            cluster_cap_dict[cid] = cluster_cap_config
+            total_cluster_capacity += cluster_cap_config
+        
+        if total_cluster_capacity < target_gross * 0.99:
+            # Relax cluster caps proportionally
+            scale_factor = (target_gross * 1.1) / total_cluster_capacity
+            warnings.warn(
+                f"[{side}] Adaptive cluster caps: {len(unique_clusters)} clusters, "
+                f"target={target_gross:.2f}, capacity={total_cluster_capacity:.2f}. "
+                f"Relaxing by {scale_factor:.2f}x"
+            )
+            for cid in cluster_cap_dict:
+                cluster_cap_dict[cid] *= scale_factor
+        
+        # Add cluster constraints with adaptive caps
+        for cid in unique_clusters:
+            cluster_mask = (cluster_ids == cid)
+            constraints.append(cp.sum(w[cluster_mask]) <= cluster_cap_dict[cid])
     
-    # Solve
+    # Solve optimization
     problem = cp.Problem(objective, constraints)
     
     try:
         problem.solve(solver=cp.ECOS, verbose=False)
         
         if problem.status not in ['optimal', 'optimal_inaccurate']:
-            warnings.warn(f"Optimization status: {problem.status}, using fallback")
-            # Fallback to equal weights
+            warnings.warn(f"[{side}] Optimization status: {problem.status}, using equal weights")
             weights_arr = np.ones(n) / n * target_gross
         else:
             weights_arr = w.value
             
     except Exception as e:
-        warnings.warn(f"Optimization failed: {e}, using equal weights")
+        warnings.warn(f"[{side}] Optimization failed: {e}, using equal weights")
         weights_arr = np.ones(n) / n * target_gross
     
     # Convert to Series
@@ -359,11 +386,12 @@ def construct_portfolio(
     universe_metadata: pd.DataFrame,
     config,
     method: str = 'cvxpy',
-    mode: str = 'ls',
-    capital: float = 1.0
+    mode: str = 'ls'
 ) -> Tuple[pd.Series, pd.Series, Dict]:
     """
     Main portfolio construction function.
+    
+    Returns weights as leverage multipliers (dimensionless, relative to equity).
     
     Parameters
     ----------
@@ -377,21 +405,19 @@ def construct_portfolio(
         'cvxpy' (optimal) or 'simple' (fast approximation)
     mode : str
         Portfolio mode: 'ls' (long/short), 'long_only', 'short_only', 'cash'
-    capital : float
-        Current capital to scale portfolio by (default 1.0)
         
     Returns
     -------
     tuple of (pd.Series, pd.Series, dict)
-        - long_weights: Long positions
-        - short_weights: Short positions
+        - long_weights: Long positions as leverage multipliers
+        - short_weights: Short positions as leverage multipliers
         - portfolio_stats: Dict with diagnostics
     """
-    if method == 'cvxpy' and CVXPY_AVAILABLE:
-        long_weights, short_weights = construct_portfolio_cvxpy(scores, universe_metadata, config, mode=mode, capital=capital)
+    if method == 'cvxpy':
+        long_weights, short_weights = construct_portfolio_cvxpy(scores, universe_metadata, config, mode=mode)
     else:
         long_weights, short_weights = construct_portfolio_simple(
-            scores, universe_metadata, config, enforce_caps=True, mode=mode, capital=capital
+            scores, universe_metadata, config, enforce_caps=True, mode=mode
         )
     
     # Compute portfolio statistics

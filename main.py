@@ -166,7 +166,7 @@ def step_3_backtest(
         universe_metadata=universe_metadata,
         config=config,
         model_type=model_type,
-        portfolio_method='simple',  # Use 'cvxpy' if installed
+        portfolio_method='cvxpy',  # cvxpy optimization (mandatory dependency)
         verbose=True
     )
     

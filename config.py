@@ -34,7 +34,7 @@ class TimeConfig:
     """Time structure parameters for walk-forward research."""
     
     # Data range
-    start_date: str = "2007-11-04"  # Start date for yfinance download
+    start_date: str = "2017-11-04"  # Start date for yfinance download
     end_date: str = "2025-11-10"  # End date
     
     # Walk-forward parameters (all in trading days)
@@ -73,16 +73,10 @@ class PortfolioConfig:
     """Portfolio construction parameters."""
     
     # Position sizing
-    long_quantile: float = 0.8   # Top 10% for long portfolio
-    short_quantile: float = 0.2  # Bottom 10% for short portfolio
-    
-    # === DEPRECATED (kept for backward compatibility) ===
-    long_leverage: float = 1.0    # DEPRECATED: Use margin regime instead
-                                  # 1.0 = 100% long (no leverage), 1.5 = 150% long (50% borrowed)
-    short_notional: float = 0.50  # DEPRECATED: Use margin regime instead
-                                  # 0.5 = short up to 50% of capital
-    
-    # === Margin Regime (NEW - recommended) ===
+    long_quantile: float = 0.9   # Top 10% for long portfolio
+    short_quantile: float = 0.1  # Bottom 10% for short portfolio
+        
+    # === Margin Regime ===
     # Choose margin regime: "reg_t_initial", "reg_t_maintenance", or "portfolio"
     margin_regime: str = "reg_t_maintenance"  # Most realistic for held positions
     
@@ -113,8 +107,8 @@ class PortfolioConfig:
     
     # Transaction costs (realistic estimates for ETF trading)
     # Note: "per side" means charged on EACH trade (buy, sell, short, cover)
-    commission_bps: float = 2.0  # Commission in basis points per side (0-2 bps typical)
-    slippage_bps: float = 8.0    # Slippage + market impact per side (5-10 bps for liquid ETFs)
+    commission_bps: float = 3.0  # Commission in basis points per side (0-2 bps typical)
+    slippage_bps: float = 5.0    # Slippage + market impact per side (5-10 bps for liquid ETFs)
     
     # === Financing Costs (NEW - separate rates for shorts vs longs) ===
     short_borrow_rate: float = 0.055      # Annual rate to borrow shares for shorting (5.5%)
@@ -126,8 +120,11 @@ class PortfolioConfig:
     borrow_cost: float = 0.055    # DEPRECATED: Now split into separate rates above
     
     # Risk limits (default caps)
-    default_cluster_cap: float = 0.10  # 10% max per theme cluster
-    default_per_etf_cap: float = 0.05  # 5% max per ETF
+    # NOTE: These are BASE caps - portfolio optimization will adaptively relax them
+    #       if needed to accommodate target leverage and actual universe size.
+    #       See portfolio_construction.py adaptive cap logic.
+    default_cluster_cap: float = 0.15  # 15% base cap per theme cluster
+    default_per_etf_cap: float = 0.10  # 10% base cap per ETF
     
     @property
     def total_cost_bps_per_side(self) -> float:
@@ -160,8 +157,9 @@ class PortfolioConfig:
             return  # Only warn once
         self._warned_deprecation = True
         
-        # Check if user is relying on deprecated parameters
-        if self.long_leverage != 1.0 or self.short_notional != 0.50:
+        # Check if user is relying on deprecated parameters (only if they exist)
+        if (hasattr(self, 'long_leverage') and hasattr(self, 'short_notional') and
+            (self.long_leverage != 1.0 or self.short_notional != 0.50)):
             warnings.warn(
                 "\n" + "="*80 + "\n"
                 "DEPRECATION WARNING: long_leverage and short_notional are deprecated.\n"
@@ -210,71 +208,70 @@ class PortfolioConfig:
             return self.long_margin_req, self.short_margin_req
     
     def compute_max_exposure(self, capital: float = 1.0) -> Dict[str, float]:
-        """Calculate maximum dollar-neutral exposure given margin constraints.
+        """Calculate maximum leverage given margin constraints.
         
-        This implements the core leverage constraint from the instructions:
+        Returns leverage ratios (dimensionless weights relative to equity) that are
+        INDEPENDENT of the absolute capital value. These are pure multipliers.
+        
         For dollar-neutral strategy (long = short):
-            max_position = capital / (margin_long + margin_short)
+            leverage = 1 / (margin_long + margin_short)
         
         Parameters
         ----------
         capital : float, default 1.0
-            Initial capital (typically 1.0 for percentage-based weights)
+            Reference capital for calculation (result is normalized by this)
         
         Returns
         -------
         dict with keys:
-            - long_exposure: Maximum dollar value of long positions
-            - short_exposure: Maximum dollar value of short positions (absolute)
-            - gross_exposure: Total exposure (long + short)
-            - gross_leverage: Gross exposure / capital
+            - long_exposure: Leverage for long positions (dimensionless)
+            - short_exposure: Leverage for short positions (dimensionless)
+            - gross_exposure: Total leverage (long + short)
+            - gross_leverage: Same as gross_exposure
             - net_exposure: Long - short (should be ~0 for dollar-neutral)
             - margin_long: Active long margin requirement
             - margin_short: Active short margin requirement
-            - long_borrowed: Amount of cash borrowed to finance longs
-            - short_proceeds: Cash received from short sales (held as collateral)
-            - margin_posted: Total margin posted to broker
         
         Examples
         --------
         >>> # Reg T maintenance: 25% long, 30% short
         >>> config.margin_regime = 'reg_t_maintenance'
-        >>> result = config.compute_max_exposure(capital=100)
-        >>> result['long_exposure']   # 100 / (0.25 + 0.30) = 181.82
-        >>> result['gross_leverage']  # 363.64 / 100 = 3.64x
+        >>> result = config.compute_max_exposure(capital=1.0)
+        >>> result['long_exposure']   # 1.0 / (0.25 + 0.30) = 1.82 (leverage ratio)
+        >>> result['gross_leverage']  # 3.64x (independent of capital value)
         """
         margin_long, margin_short = self.get_active_margins()
         
         if self.enforce_dollar_neutral:
-            # Dollar-neutral: L = S = capital / (margin_long + margin_short)
-            max_position = capital / (margin_long + margin_short)
-            long_exp = max_position
-            short_exp = max_position
+            # Dollar-neutral: leverage = 1 / (margin_long + margin_short)
+            # This is a pure ratio, independent of capital
+            max_leverage = 1.0 / (margin_long + margin_short)
+            long_exp = max_leverage
+            short_exp = max_leverage
         else:
             # User-specified ratio (e.g., 130/30 fund)
-            # Total capital constraint: margin_long * L + margin_short * S <= capital
+            # Total capital constraint: margin_long * L + margin_short * S <= 1
             # With ratio constraint: L / S = long_short_ratio
-            # Solve: L = capital * long_short_ratio / (margin_long * long_short_ratio + margin_short)
             ratio = self.long_short_ratio
-            long_exp = capital * ratio / (margin_long * ratio + margin_short)
+            long_exp = ratio / (margin_long * ratio + margin_short)
             short_exp = long_exp / ratio
-        
-        # Calculate borrowing amounts
-        long_borrowed = long_exp * (1.0 - margin_long) if long_exp > 0 else 0.0
-        short_proceeds = short_exp  # Full notional from short sales
         
         return {
             'long_exposure': long_exp,
             'short_exposure': short_exp,
             'gross_exposure': long_exp + short_exp,
-            'gross_leverage': (long_exp + short_exp) / capital if capital > 0 else 0.0,
+            'gross_leverage': long_exp + short_exp,
             'net_exposure': long_exp - short_exp,
             'margin_long': margin_long,
-            'margin_short': margin_short,
-            'long_borrowed': long_borrowed,
-            'short_proceeds': short_proceeds,
-            'margin_posted': capital
+            'margin_short': margin_short
         }
+
+
+@dataclass
+class DebugConfig:
+    """Debugging and diagnostic configuration."""
+    enable_accounting_debug: bool = False
+    debug_max_periods: int = 0  # 0 = no limit, >0 = limit number of logged periods
 
 
 @dataclass
@@ -353,7 +350,7 @@ class ComputeConfig:
     
     n_jobs: int = -1                  # Parallel jobs for feature engineering (-1 = all cores)
     verbose: bool = True              # Print progress messages
-    parallelize_backtest: bool = False  # Parallelize walk-forward backtest
+    parallelize_backtest: bool = True   # Parallelize walk-forward backtest
     
     # Data download parameters
     batch_sleep: float = 1.0          # Sleep time (seconds) after every 20 downloads to avoid rate limiting
@@ -389,6 +386,13 @@ class RegimeConfig:
 
 
 @dataclass
+class DebugConfig:
+    """Debugging and diagnostic configuration."""
+    enable_accounting_debug: bool = False
+    debug_max_periods: int = 0  # 0 = no limit, >0 = limit number of logged periods
+
+
+@dataclass
 class ResearchConfig:
     """Complete research configuration combining all sub-configs."""
     
@@ -399,6 +403,7 @@ class ResearchConfig:
     features: FeatureConfig
     compute: ComputeConfig
     regime: RegimeConfig
+    debug: DebugConfig
     
     @classmethod
     def default(cls):
@@ -410,7 +415,8 @@ class ResearchConfig:
             portfolio=PortfolioConfig(),
             features=FeatureConfig(),
             compute=ComputeConfig(),
-            regime=RegimeConfig()
+            regime=RegimeConfig(),
+            debug=DebugConfig()
         )
     
     def validate(self):
@@ -464,8 +470,11 @@ class ResearchConfig:
         # Portfolio constraints
         assert 0 < self.portfolio.long_quantile < 1, "long_quantile must be in (0, 1)"
         assert 0 < self.portfolio.short_quantile < 1, "short_quantile must be in (0, 1)"
-        assert self.portfolio.long_leverage >= 0, "long_leverage must be non-negative"
-        assert self.portfolio.short_notional >= 0, "short_notional must be non-negative"
+        # Only validate deprecated parameters if they exist
+        if hasattr(self.portfolio, 'long_leverage'):
+            assert self.portfolio.long_leverage >= 0, "long_leverage must be non-negative"
+        if hasattr(self.portfolio, 'short_notional'):
+            assert self.portfolio.short_notional >= 0, "short_notional must be non-negative"
         assert 0 < self.portfolio.long_margin_req <= 1, "long_margin_req must be in (0, 1]"
         assert 0 < self.portfolio.short_margin_req <= 1, "short_margin_req must be in (0, 1]"
         

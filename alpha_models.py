@@ -332,6 +332,14 @@ def compute_ic(
     feat = feature_values[valid_mask]
     tgt = target_values[valid_mask]
     
+    # Check if feature is constant (prevents correlation warnings)
+    if feat.nunique() <= 1:
+        return np.nan
+    
+    # Check if target is constant (shouldn't happen, but defensive)
+    if tgt.nunique() <= 1:
+        return np.nan
+    
     if method == 'spearman':
         ic, _ = spearmanr(feat, tgt)
     else:
@@ -578,16 +586,27 @@ def train_alpha_model(
             candidate_features.append(feat)
     
     # Compute CV-IC for each candidate (includes binning in CV loop)
-    cv_ic_values = {}
-    for feat in candidate_features:
+    # PARALLELIZED: Compute CV-ICs in parallel across features
+    from joblib import Parallel, delayed
+    
+    def compute_single_cv_ic(feat, train_data, target_col, config):
+        """Helper function for parallel CV-IC computation."""
         cv_ic = compute_cv_ic(
             train_data[feat],
             train_data[target_col],
             config,
             n_splits=5
         )
-        cv_ic_values[feat] = cv_ic
+        return feat, cv_ic
     
+    # Parallel execution across features
+    n_jobs = config.compute.n_jobs if hasattr(config.compute, 'n_jobs') else -1
+    cv_ic_results = Parallel(n_jobs=n_jobs, backend='threading')(
+        delayed(compute_single_cv_ic)(feat, train_data, target_col, config)
+        for feat in candidate_features
+    )
+    
+    cv_ic_values = {feat: ic for feat, ic in cv_ic_results}
     cv_ic_series = pd.Series(cv_ic_values).dropna()
     
     # Select features with |CV-IC| >= threshold

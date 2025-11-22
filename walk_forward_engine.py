@@ -195,7 +195,7 @@ def run_walk_forward_backtest(
     universe_metadata: pd.DataFrame,
     config: ResearchConfig,
     model_type: str = 'supervised_binned',
-    portfolio_method: str = 'simple',  # Default to 'simple' for robustness
+    portfolio_method: str = 'cvxpy',  # Default to cvxpy optimization
     verbose: bool = True
 ) -> pd.DataFrame:
     """
@@ -257,12 +257,7 @@ def run_walk_forward_backtest(
         print(f"Random state: {config.features.random_state}")
     
     # Validate portfolio method
-    from portfolio_construction import CVXPY_AVAILABLE
-    if portfolio_method == 'cvxpy' and not CVXPY_AVAILABLE:
-        if verbose:
-            print(f"[warn] cvxpy not available, falling back to 'simple' method")
-        portfolio_method = 'simple'
-    elif portfolio_method not in ['cvxpy', 'simple']:
+    if portfolio_method not in ['cvxpy', 'simple']:
         raise ValueError(f"portfolio_method must be 'cvxpy' or 'simple', got '{portfolio_method}'")
     
     # Get unique dates
@@ -305,238 +300,510 @@ def run_walk_forward_backtest(
                 print(f"[warn] Proceeding without regime switching")
             regime_series = None
     
-    results = []
-    diagnostics = []  # Store diagnostics for each rebalance period
-    
-    # FIX 4: Capital compounding and tracking
-    current_capital = 1.0
-    capital_history = []
-    
-    # Track previous weights for turnover calculation
-    prev_long_weights = None
-    prev_short_weights = None
-    
-    # Diagnostic tracking
-    ic_history = []  # Store IC vectors for each window
-    feature_selection_history = []  # Track which features were selected
-    universe_size_history = []  # Track universe size after each filter
-    
-    # Track timing for each step
-    import time
-    total_train_time = 0
-    total_score_time = 0
-    total_portfolio_time = 0
-    total_eval_time = 0
-    
-    for i, t0 in enumerate(current_dates):
-        rebalance_start = time.time()
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"[{i+1}/{len(current_dates)}] Rebalance date: {t0.date()}")
-        
-        # =====================================================================
-        # 1. Define training window
-        # =====================================================================
-        t_train_start = t0 - pd.Timedelta(days=config.time.TRAINING_WINDOW_DAYS)
-        t_train_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
+    # =====================================================================
+    # Parallel vs Sequential Execution
+    # =====================================================================
+    if config.compute.parallelize_backtest:
+        # PARALLEL EXECUTION: Process rebalance dates in parallel
+        from joblib import Parallel, delayed
         
         if verbose:
-            print(f"Training window: [{t_train_start.date()}, {t_train_end.date()}]")
+            print(f"\n[parallel] Processing {len(current_dates)} rebalance dates in parallel...")
+            print(f"[parallel] Using {config.compute.n_jobs} jobs")
         
-        # Check training window is valid
-        if t_train_end <= t_train_start:
-            if verbose:
-                print("[skip] Invalid training window")
-            continue
-        
-        # =====================================================================
-        # 2. Train model
-        # =====================================================================
-        if verbose:
-            print(f"[train] Training {model_type} model...")
-        
-        train_start = time.time()
-        try:
-            model, selected_features, ic_series = train_alpha_model(
-                panel=panel_df,
-                universe_metadata=universe_metadata,
-                t_train_start=t_train_start,
-                t_train_end=t_train_end,
-                config=config,
-                model_type=model_type
+        def process_rebalance_period(i, t0, panel_df, universe_metadata, config, model_type, portfolio_method, regime_series, verbose_inner):
+            """Process a single rebalance period (for parallel execution)."""
+            import time
+            import pandas as pd
+            import numpy as np
+            
+            rebalance_start = time.time()
+            if verbose_inner:
+                print(f"\n{'='*60}")
+                print(f"[{i+1}/{len(current_dates)}] Rebalance date: {t0.date()}")
+            
+            # Define training window
+            t_train_start = t0 - pd.Timedelta(days=config.time.TRAINING_WINDOW_DAYS)
+            t_train_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
+            
+            if verbose_inner:
+                print(f"Training window: [{t_train_start.date()}, {t_train_end.date()}]")
+            
+            if t_train_end <= t_train_start:
+                if verbose_inner:
+                    print("[skip] Invalid training window")
+                return None
+            
+            # Train model
+            if verbose_inner:
+                print(f"[train] Training {model_type} model...")
+            
+            train_start = time.time()
+            try:
+                model, selected_features, ic_series = train_alpha_model(
+                    panel=panel_df,
+                    universe_metadata=universe_metadata,
+                    t_train_start=t_train_start,
+                    t_train_end=t_train_end,
+                    config=config,
+                    model_type=model_type
+                )
+                
+                diagnostics_entry = {
+                    'date': t0,
+                    'n_features': len(selected_features),
+                    'selected_features': selected_features,
+                    'ic_values': ic_series.to_dict() if ic_series is not None else {}
+                }
+                train_elapsed = time.time() - train_start
+            except Exception as e:
+                if verbose_inner:
+                    print(f"[error] Model training failed: {e}")
+                return None
+            
+            # Get eligible universe
+            eligible_universe = get_eligible_universe(
+                panel_df, universe_metadata, t0, config, verbose_inner
             )
             
-            # Record diagnostics
-            diagnostics_entry = {
-                'date': t0,
-                'n_features': len(selected_features),
-                'selected_features': selected_features,
-                'ic_values': ic_series.to_dict() if ic_series is not None else {}
-            }
-            train_elapsed = time.time() - train_start
-            total_train_time += train_elapsed
+            if len(eligible_universe) < 10:
+                if verbose_inner:
+                    print(f"[skip] Insufficient universe size: {len(eligible_universe)}")
+                return None
             
-        except Exception as e:
-            if verbose:
-                print(f"[error] Model training failed: {e}")
-            continue
+            if verbose_inner:
+                print(f"[universe] Eligible tickers: {len(eligible_universe)}")
+            
+            diagnostics_entry['universe_size'] = len(eligible_universe)
+            
+            # Score eligible tickers
+            if verbose_inner:
+                print(f"[score] Generating cross-sectional scores...")
+            
+            score_start = time.time()
+            try:
+                scores = model.score_at_date(
+                    panel=panel_df,
+                    t0=t0,
+                    universe_metadata=universe_metadata,
+                    config=config
+                )
+                score_elapsed = time.time() - score_start
+            except Exception as e:
+                if verbose_inner:
+                    print(f"[error] Scoring failed: {e}")
+                return None
+            
+            scores = scores[scores.index.isin(eligible_universe.index)]
+            
+            if len(scores) < 10:
+                if verbose_inner:
+                    print(f"[skip] Insufficient scores: {len(scores)}")
+                return None
+            
+            # Filter universe_metadata to eligible tickers
+            if 'ticker' in universe_metadata.columns:
+                eligible_metadata = universe_metadata[
+                    universe_metadata['ticker'].isin(eligible_universe.index)
+                ].copy()
+            else:
+                eligible_metadata = universe_metadata[
+                    universe_metadata.index.isin(eligible_universe.index)
+                ].copy()
+            
+            # Determine portfolio mode from regime
+            if regime_series is not None:
+                current_regime = regime_series.get(t0, 'range')
+                mode = get_portfolio_mode_for_regime(current_regime)
+                if verbose_inner:
+                    print(f"[regime] Current regime: {current_regime} → mode: {mode}")
+            else:
+                mode = 'ls'
+                current_regime = 'none'
+            
+            # Construct portfolio
+            if verbose_inner:
+                print(f"[portfolio] Constructing portfolio with caps...")
+            
+            portfolio_start = time.time()
+            try:
+                long_weights, short_weights, portfolio_stats = construct_portfolio(
+                    scores=scores,
+                    universe_metadata=eligible_metadata,
+                    config=config,
+                    method=portfolio_method,
+                    mode=mode
+                )
+                portfolio_elapsed = time.time() - portfolio_start
+            except Exception as e:
+                if verbose_inner:
+                    print(f"[error] Portfolio construction failed: {e}")
+                return None
+            
+            if verbose_inner:
+                print(f"[portfolio] Long: {portfolio_stats['n_long']} positions, "
+                      f"gross: {portfolio_stats['gross_long']:.2%}")
+                print(f"[portfolio] Short: {portfolio_stats['n_short']} positions, "
+                      f"gross: {portfolio_stats['gross_short']:.2%}")
+                
+                if 'cap_violations' in portfolio_stats:
+                    print(f"[warn] Cap violations: {portfolio_stats['cap_violations']}")
+            
+            # Evaluate performance (no previous weights in parallel mode)
+            if verbose_inner:
+                print(f"[eval] Evaluating forward returns...")
+            
+            eval_start = time.time()
+            try:
+                performance = evaluate_portfolio_return(
+                    panel_df=panel_df,
+                    t0=t0,
+                    long_weights=long_weights,
+                    short_weights=short_weights,
+                    config=config,
+                    prev_long_weights=None,  # Not available in parallel
+                    prev_short_weights=None
+                )
+                eval_elapsed = time.time() - eval_start
+            except Exception as e:
+                if verbose_inner:
+                    print(f"[error] Evaluation failed: {e}")
+                return None
+            
+            performance.update(portfolio_stats)
+            
+            rebalance_elapsed = time.time() - rebalance_start
+            if verbose_inner:
+                print(f"[result] Long: {performance['long_ret'] * 100:.2f}%, Short: {performance['short_ret'] * 100:.2f}%, "
+                      f"L/S: {performance['ls_return'] * 100:.2f}%, Turnover: {performance['turnover']:.2%}, "
+                      f"TxnCost: {performance['transaction_cost']:.4%}")
+                print(f"[time] Rebalance completed in {rebalance_elapsed:.2f}s "
+                      f"(train: {train_elapsed:.1f}s, score: {score_elapsed:.1f}s, "
+                      f"portfolio: {portfolio_elapsed:.1f}s, eval: {eval_elapsed:.1f}s)")
+            
+            return {
+                'performance': performance,
+                'diagnostics': diagnostics_entry,
+                'long_weights': long_weights,
+                'short_weights': short_weights,
+                'regime': current_regime,
+                'mode': mode,
+                'eligible_metadata': eligible_metadata
+            }
         
-        # =====================================================================
-        # 3. Get eligible universe at t0
-        # =====================================================================
-        eligible_universe = get_eligible_universe(
-            panel_df, universe_metadata, t0, config, verbose
+        # Execute in parallel
+        parallel_results = Parallel(n_jobs=config.compute.n_jobs, backend='loky')(
+            delayed(process_rebalance_period)(
+                i, t0, panel_df, universe_metadata, config, model_type, 
+                portfolio_method, regime_series, False  # verbose_inner=False for parallel
+            )
+            for i, t0 in enumerate(current_dates)
         )
         
-        if len(eligible_universe) < 10:
-            if verbose:
-                print(f"[skip] Insufficient universe size: {len(eligible_universe)}")
-            continue
+        # Process results and compute capital path sequentially
+        results = []
+        diagnostics = []
+        accounting_debug_rows = []
+        capital_history = []
+        current_capital = 1.0
+        
+        for i, result in enumerate(parallel_results):
+            if result is None:
+                continue
+            
+            performance = result['performance']
+            
+            # Update capital using decimal return
+            period_return_decimal = performance['ls_return']
+            current_capital *= (1.0 + period_return_decimal)
+            performance['capital'] = current_capital
+            capital_history.append(current_capital)
+            
+            # Accounting debug logging
+            if config.debug.enable_accounting_debug:
+                if config.debug.debug_max_periods == 0 or len(accounting_debug_rows) < config.debug.debug_max_periods:
+                    accounting_debug_rows.append({
+                        "date": result['diagnostics']['date'],
+                        "regime": result['regime'],
+                        "mode": result['mode'],
+                        "universe_size": len(result['eligible_metadata']),
+                        "gross_long": float(result['long_weights'].abs().sum()) if len(result['long_weights']) > 0 else 0.0,
+                        "gross_short": float(result['short_weights'].abs().sum()) if len(result['short_weights']) > 0 else 0.0,
+                        "naive_ls_ret": performance.get("naive_ls_ret", np.nan),
+                        "cash_pnl": performance.get("cash_pnl", np.nan),
+                        "transaction_cost": performance.get("transaction_cost", np.nan),
+                        "borrow_cost": performance.get("borrow_cost", np.nan),
+                        "ls_return": performance.get("ls_return", np.nan),
+                        "capital": current_capital,
+                    })
+            
+            results.append(performance)
+            diagnostics.append(result['diagnostics'])
         
         if verbose:
-            print(f"[universe] Eligible tickers: {len(eligible_universe)}")
+            print(f"\n[parallel] Completed {len(results)} rebalance periods")
         
-        # Add universe size to diagnostics
-        diagnostics_entry['universe_size'] = len(eligible_universe)
+        # NOTE: In parallel mode, timing is not tracked per-step (would need aggregation)
+        # Initialize variables to prevent UnboundLocalError in reporting section
+        total_train_time = 0.0
+        total_score_time = 0.0
+        total_portfolio_time = 0.0
+        total_eval_time = 0.0
+    
+    else:
+        # SEQUENTIAL EXECUTION: Original implementation
+        results = []
+        diagnostics = []  # Store diagnostics for each rebalance period
         
-        # =====================================================================
-        # 4. Score eligible tickers
-        # =====================================================================
-        if verbose:
-            print(f"[score] Generating cross-sectional scores...")
+        # FIX 4: Capital compounding and tracking
+        current_capital = 1.0
+        capital_history = []
         
-        score_start = time.time()
-        try:
-            scores = model.score_at_date(
-                panel=panel_df,
-                t0=t0,
-                universe_metadata=universe_metadata,
-                config=config
-            )
-            score_elapsed = time.time() - score_start
-            total_score_time += score_elapsed
-        except Exception as e:
+        # Accounting debug logging
+        accounting_debug_rows = []
+        
+        # Track previous weights for turnover calculation
+        prev_long_weights = None
+        prev_short_weights = None
+        
+        # Diagnostic tracking
+        ic_history = []  # Store IC vectors for each window
+        feature_selection_history = []  # Track which features were selected
+        universe_size_history = []  # Track universe size after each filter
+        
+        # Track timing for each step
+        import time
+        total_train_time = 0
+        total_score_time = 0
+        total_portfolio_time = 0
+        total_eval_time = 0
+        
+        for i, t0 in enumerate(current_dates):
+            rebalance_start = time.time()
             if verbose:
-                print(f"[error] Scoring failed: {e}")
-            continue
-        
-        # Filter scores to eligible universe
-        scores = scores[scores.index.isin(eligible_universe.index)]
-        
-        if len(scores) < 10:
+                print(f"\n{'='*60}")
+                print(f"[{i+1}/{len(current_dates)}] Rebalance date: {t0.date()}")
+            
+            # =====================================================================
+            # 1. Define training window
+            # =====================================================================
+            t_train_start = t0 - pd.Timedelta(days=config.time.TRAINING_WINDOW_DAYS)
+            t_train_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
+            
             if verbose:
-                print(f"[skip] Insufficient scores: {len(scores)}")
-            continue
-        
-        # =====================================================================
-        # 5. Construct portfolio
-        # =====================================================================
-        if verbose:
-            print(f"[portfolio] Constructing portfolio with caps...")
-        
-        # CRITICAL: Filter universe_metadata to only eligible tickers
-        # This ensures portfolio construction only considers eligible universe
-        if 'ticker' in universe_metadata.columns:
-            eligible_metadata = universe_metadata[
-                universe_metadata['ticker'].isin(eligible_universe.index)
-            ].copy()
-        else:
-            eligible_metadata = universe_metadata[
-                universe_metadata.index.isin(eligible_universe.index)
-            ].copy()
-        
-        # =====================================================================
-        # 5. Determine portfolio mode from regime
-        # =====================================================================
-        if regime_series is not None:
-            # Get regime at t0 (already shifted by 1 day to avoid look-ahead)
-            current_regime = regime_series.get(t0, 'range')  # Default to range if not found
-            mode = get_portfolio_mode_for_regime(current_regime)
+                print(f"Training window: [{t_train_start.date()}, {t_train_end.date()}]")
+            
+            # Check training window is valid
+            if t_train_end <= t_train_start:
+                if verbose:
+                    print("[skip] Invalid training window")
+                    continue
+            
+            # =====================================================================
+            # 2. Train model
+            # =====================================================================
             if verbose:
-                print(f"[regime] Current regime: {current_regime} → mode: {mode}")
-        else:
-            mode = 'ls'  # Default long/short mode
-        
-        portfolio_start = time.time()
-        try:
-            # FIX 5: Pass capital explicitly to constructor
-            # Constructor now handles scaling, no need for post-hoc multiplication
-            long_weights, short_weights, portfolio_stats = construct_portfolio(
-                scores=scores,
-                universe_metadata=eligible_metadata,
-                config=config,
-                method=portfolio_method,
-                mode=mode,
-                capital=current_capital
+                print(f"[train] Training {model_type} model...")
+            
+            train_start = time.time()
+            try:
+                model, selected_features, ic_series = train_alpha_model(
+                    panel=panel_df,
+                    universe_metadata=universe_metadata,
+                    t_train_start=t_train_start,
+                    t_train_end=t_train_end,
+                    config=config,
+                    model_type=model_type
+                )
+                
+                # Record diagnostics
+                diagnostics_entry = {
+                    'date': t0,
+                    'n_features': len(selected_features),
+                    'selected_features': selected_features,
+                    'ic_values': ic_series.to_dict() if ic_series is not None else {}
+                }
+                train_elapsed = time.time() - train_start
+                total_train_time += train_elapsed
+                
+            except Exception as e:
+                if verbose:
+                    print(f"[error] Model training failed: {e}")
+                continue
+            
+            # =====================================================================
+            # 3. Get eligible universe at t0
+            # =====================================================================
+            eligible_universe = get_eligible_universe(
+                panel_df, universe_metadata, t0, config, verbose
             )
             
-            portfolio_elapsed = time.time() - portfolio_start
-            total_portfolio_time += portfolio_elapsed
-        except Exception as e:
-            if verbose:
-                print(f"[error] Portfolio construction failed: {e}")
-            continue
-        
-        if verbose:
-            print(f"[portfolio] Long: {portfolio_stats['n_long']} positions, "
-                  f"gross: {portfolio_stats['gross_long']:.2%}")
-            print(f"[portfolio] Short: {portfolio_stats['n_short']} positions, "
-                  f"gross: {portfolio_stats['gross_short']:.2%}")
+            if len(eligible_universe) < 10:
+                if verbose:
+                    print(f"[skip] Insufficient universe size: {len(eligible_universe)}")
+                continue
             
-            if 'cap_violations' in portfolio_stats:
-                print(f"[warn] Cap violations: {portfolio_stats['cap_violations']}")
-        
-        # =====================================================================
-        # 6. Evaluate performance
-        # =====================================================================
-        if verbose:
-            print(f"[eval] Evaluating forward returns...")
-        
-        eval_start = time.time()
-        try:
-            performance = evaluate_portfolio_return(
-                panel_df=panel_df,
-                t0=t0,
-                long_weights=long_weights,
-                short_weights=short_weights,
-                config=config,
-                prev_long_weights=prev_long_weights,
-                prev_short_weights=prev_short_weights
-            )
-            eval_elapsed = time.time() - eval_start
-            total_eval_time += eval_elapsed
-        except Exception as e:
             if verbose:
-                print(f"[error] Evaluation failed: {e}")
-            continue
-        
-        # Add portfolio stats to performance
-        performance.update(portfolio_stats)
-        
-        # FIX 4: Update capital using decimal return
-        period_return_decimal = performance['ls_return']  # Already decimal
-        current_capital *= (1.0 + period_return_decimal)
-        performance['capital'] = current_capital
-        capital_history.append(current_capital)
-        
-        # Add rebalance timing
-        rebalance_elapsed = time.time() - rebalance_start
-        if verbose:
-            print(f"[result] Long: {performance['long_ret'] * 100:.2f}%, Short: {performance['short_ret'] * 100:.2f}%, "
-                  f"L/S: {performance['ls_return'] * 100:.2f}%, Turnover: {performance['turnover']:.2%}, "
-                  f"TxnCost: {performance['transaction_cost']:.4%}")
-            print(f"[time] Rebalance completed in {rebalance_elapsed:.2f}s "
-                  f"(train: {train_elapsed:.1f}s, score: {score_elapsed:.1f}s, "
-                  f"portfolio: {portfolio_elapsed:.1f}s, eval: {eval_elapsed:.1f}s)")
-        
-        results.append(performance)
-        
-        # Append diagnostics for this period
-        diagnostics.append(diagnostics_entry)
-        
-        # Update previous weights for next iteration
-        prev_long_weights = long_weights.copy()
-        prev_short_weights = short_weights.copy()
+                print(f"[universe] Eligible tickers: {len(eligible_universe)}")
+            
+            # Add universe size to diagnostics
+            diagnostics_entry['universe_size'] = len(eligible_universe)
+            
+            # =====================================================================
+            # 4. Score eligible tickers
+            # =====================================================================
+            if verbose:
+                print(f"[score] Generating cross-sectional scores...")
+            
+            score_start = time.time()
+            try:
+                scores = model.score_at_date(
+                    panel=panel_df,
+                    t0=t0,
+                    universe_metadata=universe_metadata,
+                    config=config
+                )
+                score_elapsed = time.time() - score_start
+                total_score_time += score_elapsed
+            except Exception as e:
+                if verbose:
+                    print(f"[error] Scoring failed: {e}")
+                continue
+            
+            # Filter scores to eligible universe
+            scores = scores[scores.index.isin(eligible_universe.index)]
+            
+            if len(scores) < 10:
+                if verbose:
+                    print(f"[skip] Insufficient scores: {len(scores)}")
+                continue
+            
+            # =====================================================================
+            # 5. Construct portfolio
+            # =====================================================================
+            if verbose:
+                print(f"[portfolio] Constructing portfolio with caps...")
+            
+            # CRITICAL: Filter universe_metadata to only eligible tickers
+            # This ensures portfolio construction only considers eligible universe
+            if 'ticker' in universe_metadata.columns:
+                eligible_metadata = universe_metadata[
+                    universe_metadata['ticker'].isin(eligible_universe.index)
+                ].copy()
+            else:
+                eligible_metadata = universe_metadata[
+                    universe_metadata.index.isin(eligible_universe.index)
+                ].copy()
+            
+            # =====================================================================
+            # 5. Determine portfolio mode from regime
+            # =====================================================================
+            if regime_series is not None:
+                # Get regime at t0 (already shifted by 1 day to avoid look-ahead)
+                current_regime = regime_series.get(t0, 'range')  # Default to range if not found
+                mode = get_portfolio_mode_for_regime(current_regime)
+                if verbose:
+                    print(f"[regime] Current regime: {current_regime} → mode: {mode}")
+            else:
+                mode = 'ls'  # Default long/short mode
+            
+            portfolio_start = time.time()
+            try:
+                # Construct portfolio with dimensionless leverage weights
+                # No capital parameter - weights are leverage multipliers relative to equity
+                long_weights, short_weights, portfolio_stats = construct_portfolio(
+                    scores=scores,
+                    universe_metadata=eligible_metadata,
+                    config=config,
+                    method=portfolio_method,
+                    mode=mode
+                )
+                
+                portfolio_elapsed = time.time() - portfolio_start
+                total_portfolio_time += portfolio_elapsed
+            except Exception as e:
+                if verbose:
+                    print(f"[error] Portfolio construction failed: {e}")
+                continue
+            
+            if verbose:
+                print(f"[portfolio] Long: {portfolio_stats['n_long']} positions, "
+                      f"gross: {portfolio_stats['gross_long']:.2%}")
+                print(f"[portfolio] Short: {portfolio_stats['n_short']} positions, "
+                      f"gross: {portfolio_stats['gross_short']:.2%}")
+                
+                if 'cap_violations' in portfolio_stats:
+                    print(f"[warn] Cap violations: {portfolio_stats['cap_violations']}")
+            
+            # =====================================================================
+            # 6. Evaluate performance
+            # =====================================================================
+            if verbose:
+                print(f"[eval] Evaluating forward returns...")
+            
+            eval_start = time.time()
+            try:
+                performance = evaluate_portfolio_return(
+                    panel_df=panel_df,
+                    t0=t0,
+                    long_weights=long_weights,
+                    short_weights=short_weights,
+                    config=config,
+                    prev_long_weights=prev_long_weights,
+                    prev_short_weights=prev_short_weights
+                )
+                eval_elapsed = time.time() - eval_start
+                total_eval_time += eval_elapsed
+            except Exception as e:
+                if verbose:
+                    print(f"[error] Evaluation failed: {e}")
+                continue
+            
+            # Add portfolio stats to performance
+            performance.update(portfolio_stats)
+            
+            # FIX 4: Update capital using decimal return
+            period_return_decimal = performance['ls_return']  # Already decimal
+            current_capital *= (1.0 + period_return_decimal)
+            performance['capital'] = current_capital
+            capital_history.append(current_capital)
+            
+            # Accounting debug logging
+            if config.debug.enable_accounting_debug:
+                if config.debug.debug_max_periods == 0 or len(accounting_debug_rows) < config.debug.debug_max_periods:
+                    accounting_debug_rows.append({
+                        "date": t0,
+                        "regime": current_regime if regime_series is not None else "none",
+                        "mode": mode,
+                        "universe_size": len(eligible_metadata),
+                        "gross_long": float(long_weights.abs().sum()) if len(long_weights) > 0 else 0.0,
+                        "gross_short": float(short_weights.abs().sum()) if len(short_weights) > 0 else 0.0,
+                        "naive_ls_ret": performance.get("naive_ls_ret", np.nan),
+                        "cash_pnl": performance.get("cash_pnl", np.nan),
+                        "transaction_cost": performance.get("transaction_cost", np.nan),
+                        "borrow_cost": performance.get("borrow_cost", np.nan),
+                        "ls_return": performance.get("ls_return", np.nan),
+                        "capital": current_capital,
+                    })
+            
+            # Add rebalance timing
+            rebalance_elapsed = time.time() - rebalance_start
+            if verbose:
+                print(f"[result] Long: {performance['long_ret'] * 100:.2f}%, Short: {performance['short_ret'] * 100:.2f}%, "
+                      f"L/S: {performance['ls_return'] * 100:.2f}%, Turnover: {performance['turnover']:.2%}, "
+                      f"TxnCost: {performance['transaction_cost']:.4%}")
+                print(f"[time] Rebalance completed in {rebalance_elapsed:.2f}s "
+                      f"(train: {train_elapsed:.1f}s, score: {score_elapsed:.1f}s, "
+                      f"portfolio: {portfolio_elapsed:.1f}s, eval: {eval_elapsed:.1f}s)")
+            
+            results.append(performance)
+            
+            # Append diagnostics for this period
+            diagnostics.append(diagnostics_entry)
+            
+            # Update previous weights for next iteration
+            prev_long_weights = long_weights.copy()
+            prev_short_weights = short_weights.copy()
     
     # =========================================================================
     # Convert results to DataFrame
@@ -582,6 +849,15 @@ def run_walk_forward_backtest(
         total_backtest_time = total_train_time + total_score_time + total_portfolio_time + total_eval_time
         print(f"  Total backtest time:    {total_backtest_time:.2f}s ({total_backtest_time/60:.2f}min)")
         print(f"  Average per rebalance:  {total_backtest_time/len(results_df):.2f}s")
+    
+    # Save accounting debug log if enabled
+    if accounting_debug_rows:
+        debug_df = pd.DataFrame(accounting_debug_rows).set_index("date")
+        debug_path = config.paths.output_dir / "accounting_debug_log.csv"
+        debug_df.to_csv(debug_path)
+        if verbose:
+            print(f"\n[debug] Accounting debug log saved to: {debug_path}")
+            print(f"[debug] Logged {len(accounting_debug_rows)} periods")
     
     # Save diagnostics if requested
     if config.compute.save_intermediate and len(diagnostics) > 0:
