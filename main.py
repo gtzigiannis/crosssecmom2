@@ -13,6 +13,7 @@ Usage:
 import argparse
 import pandas as pd
 from pathlib import Path
+import time
 
 from config import get_default_config, ResearchConfig
 from universe_metadata import build_universe_metadata, validate_universe_metadata
@@ -34,9 +35,12 @@ def step_1_feature_engineering(config: ResearchConfig):
     print("STEP 1: FEATURE ENGINEERING")
     print("="*80)
     
+    step_start = time.time()
     panel_df = run_feature_engineering(config)
+    step_elapsed = time.time() - step_start
     
     print(f"\n[done] Panel saved to: {config.paths.panel_parquet}")
+    print(f"[time] Feature engineering completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")
     return panel_df
 
 
@@ -56,6 +60,8 @@ def step_2_build_metadata(config: ResearchConfig, returns_df=None):
     print("\n" + "="*80)
     print("STEP 2: BUILD UNIVERSE METADATA")
     print("="*80)
+    
+    step_start = time.time()
     
     # Check if universe metadata CSV exists
     if not Path(config.paths.universe_metadata_csv).exists():
@@ -115,6 +121,9 @@ def step_2_build_metadata(config: ResearchConfig, returns_df=None):
         print(f"\nNumber of theme clusters: {universe_metadata['cluster_id'].nunique()}")
         print(f"Cluster caps range: [{cluster_caps.min():.2%}, {cluster_caps.max():.2%}]")
     
+    step_elapsed = time.time() - step_start
+    print(f"\n[time] Metadata building completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")
+    
     return universe_metadata, cluster_caps
 
 
@@ -136,6 +145,8 @@ def step_3_backtest(
     print("\n" + "="*80)
     print("STEP 3: WALK-FORWARD BACKTEST")
     print("="*80)
+    
+    step_start = time.time()
     
     # Load data if not provided
     if panel_df is None:
@@ -163,6 +174,9 @@ def step_3_backtest(
     results_df.to_csv(config.paths.results_csv)
     print(f"\n[save] Results saved to: {config.paths.results_csv}")
     
+    step_elapsed = time.time() - step_start
+    print(f"[time] Backtest completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")
+    
     return results_df
 
 
@@ -173,6 +187,8 @@ def step_4_analyze(config: ResearchConfig, results_df: pd.DataFrame = None):
     print("\n" + "="*80)
     print("STEP 4: ANALYZE RESULTS")
     print("="*80)
+    
+    step_start = time.time()
     
     # Load results if not provided
     if results_df is None:
@@ -187,6 +203,9 @@ def step_4_analyze(config: ResearchConfig, results_df: pd.DataFrame = None):
     print("="*80)
     for key, value in stats.items():
         print(f"{key:20s}: {value}")
+    
+    step_elapsed = time.time() - step_start
+    print(f"\n[time] Analysis completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")
     
     return stats
 
@@ -222,6 +241,9 @@ def main():
     print(f"  Feature max lag: {config.time.FEATURE_MAX_LAG_DAYS} days")
     print(f"  Model type: {args.model}")
     
+    # Start overall timer
+    overall_start = time.time()
+    
     # Execute requested step(s)
     if args.step == 'feature_eng' or args.step == 'all':
         panel_df = step_1_feature_engineering(config)
@@ -241,9 +263,13 @@ def main():
     if args.step == 'analyze' or args.step == 'all':
         stats = step_4_analyze(config, results_df)
     
+    # Calculate total elapsed time
+    overall_elapsed = time.time() - overall_start
+    
     print("\n" + "="*80)
     print("COMPLETE")
     print("="*80)
+    print(f"[time] Total execution time: {overall_elapsed:.2f} seconds ({overall_elapsed/60:.2f} minutes, {overall_elapsed/3600:.2f} hours)")
 
 
 if __name__ == "__main__":

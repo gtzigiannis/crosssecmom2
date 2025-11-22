@@ -251,7 +251,9 @@ def run_walk_forward_backtest(
         print(f"Step size: {config.time.STEP_DAYS} days")
         print(f"Feature max lag: {config.time.FEATURE_MAX_LAG_DAYS} days")
         print(f"Transaction costs: {config.portfolio.total_cost_bps_per_side:.1f} bps per side")
-        print(f"Borrow cost: {config.portfolio.borrow_cost:.1%} annualized")
+        print(f"Short borrow rate: {config.portfolio.short_borrow_rate:.2%} annualized")
+        print(f"Margin interest rate: {config.portfolio.margin_interest_rate:.2%} annualized")
+        print(f"Margin regime: {config.portfolio.margin_regime}")
         print(f"Random state: {config.features.random_state}")
     
     # Validate portfolio method
@@ -315,7 +317,15 @@ def run_walk_forward_backtest(
     feature_selection_history = []  # Track which features were selected
     universe_size_history = []  # Track universe size after each filter
     
+    # Track timing for each step
+    import time
+    total_train_time = 0
+    total_score_time = 0
+    total_portfolio_time = 0
+    total_eval_time = 0
+    
     for i, t0 in enumerate(current_dates):
+        rebalance_start = time.time()
         if verbose:
             print(f"\n{'='*60}")
             print(f"[{i+1}/{len(current_dates)}] Rebalance date: {t0.date()}")
@@ -341,6 +351,7 @@ def run_walk_forward_backtest(
         if verbose:
             print(f"[train] Training {model_type} model...")
         
+        train_start = time.time()
         try:
             model, selected_features, ic_series = train_alpha_model(
                 panel=panel_df,
@@ -358,6 +369,8 @@ def run_walk_forward_backtest(
                 'selected_features': selected_features,
                 'ic_values': ic_series.to_dict() if ic_series is not None else {}
             }
+            train_elapsed = time.time() - train_start
+            total_train_time += train_elapsed
             
         except Exception as e:
             if verbose:
@@ -388,6 +401,7 @@ def run_walk_forward_backtest(
         if verbose:
             print(f"[score] Generating cross-sectional scores...")
         
+        score_start = time.time()
         try:
             scores = model.score_at_date(
                 panel=panel_df,
@@ -395,6 +409,8 @@ def run_walk_forward_backtest(
                 universe_metadata=universe_metadata,
                 config=config
             )
+            score_elapsed = time.time() - score_start
+            total_score_time += score_elapsed
         except Exception as e:
             if verbose:
                 print(f"[error] Scoring failed: {e}")
@@ -437,6 +453,7 @@ def run_walk_forward_backtest(
         else:
             mode = 'ls'  # Default long/short mode
         
+        portfolio_start = time.time()
         try:
             long_weights, short_weights, portfolio_stats = construct_portfolio(
                 scores=scores,
@@ -445,6 +462,8 @@ def run_walk_forward_backtest(
                 method=portfolio_method,
                 mode=mode
             )
+            portfolio_elapsed = time.time() - portfolio_start
+            total_portfolio_time += portfolio_elapsed
         except Exception as e:
             if verbose:
                 print(f"[error] Portfolio construction failed: {e}")
@@ -465,6 +484,7 @@ def run_walk_forward_backtest(
         if verbose:
             print(f"[eval] Evaluating forward returns...")
         
+        eval_start = time.time()
         try:
             performance = evaluate_portfolio_return(
                 panel_df=panel_df,
@@ -475,6 +495,8 @@ def run_walk_forward_backtest(
                 prev_long_weights=prev_long_weights,
                 prev_short_weights=prev_short_weights
             )
+            eval_elapsed = time.time() - eval_start
+            total_eval_time += eval_elapsed
         except Exception as e:
             if verbose:
                 print(f"[error] Evaluation failed: {e}")
@@ -483,15 +505,15 @@ def run_walk_forward_backtest(
         # Add portfolio stats to performance
         performance.update(portfolio_stats)
         
+        # Add rebalance timing
+        rebalance_elapsed = time.time() - rebalance_start
         if verbose:
-            ret_str = f"[result] Long: {performance['long_ret']:.2%}, "
-            ret_str += f"Short: {performance['short_ret']:.2%}, "
-            ret_str += f"L/S: {performance['ls_return']:.2%}"
-            if performance.get('turnover', 0) > 0:
-                ret_str += f", Turnover: {performance['turnover']:.2%}"
-            if performance.get('transaction_cost', 0) > 0:
-                ret_str += f", TxnCost: {performance['transaction_cost']:.4%}"
-            print(ret_str)
+            print(f"[result] Long: {performance['long_ret']:.2f}%, Short: {performance['short_ret']:.2f}%, "
+                  f"L/S: {performance['ls_return']:.2f}%, Turnover: {performance['turnover']:.2%}, "
+                  f"TxnCost: {performance['transaction_cost']:.4%}")
+            print(f"[time] Rebalance completed in {rebalance_elapsed:.2f}s "
+                  f"(train: {train_elapsed:.1f}s, score: {score_elapsed:.1f}s, "
+                  f"portfolio: {portfolio_elapsed:.1f}s, eval: {eval_elapsed:.1f}s)")
         
         results.append(performance)
         
@@ -520,6 +542,14 @@ def run_walk_forward_backtest(
         print("="*80)
         print(f"Total periods: {len(results_df)}")
         print(f"Date range: {results_df.index[0].date()} to {results_df.index[-1].date()}")
+        print(f"\n[time] Backtest timing breakdown:")
+        print(f"  Total training time:    {total_train_time:.2f}s ({total_train_time/60:.2f}min)")
+        print(f"  Total scoring time:     {total_score_time:.2f}s ({total_score_time/60:.2f}min)")
+        print(f"  Total portfolio time:   {total_portfolio_time:.2f}s ({total_portfolio_time/60:.2f}min)")
+        print(f"  Total evaluation time:  {total_eval_time:.2f}s ({total_eval_time/60:.2f}min)")
+        total_backtest_time = total_train_time + total_score_time + total_portfolio_time + total_eval_time
+        print(f"  Total backtest time:    {total_backtest_time:.2f}s ({total_backtest_time/60:.2f}min)")
+        print(f"  Average per rebalance:  {total_backtest_time/len(results_df):.2f}s")
     
     # Save diagnostics if requested
     if config.compute.save_intermediate and len(diagnostics) > 0:
@@ -581,6 +611,288 @@ def run_walk_forward_backtest(
     return results_df
 
 
+def bootstrap_performance_stats(
+    returns: pd.Series,
+    n_bootstrap: int = 1000,
+    block_size: int = 6,
+    random_state: int = 42
+) -> Dict:
+    """
+    Generate bootstrap confidence intervals for performance statistics.
+    
+    Uses block bootstrap to preserve time-series autocorrelation structure.
+    
+    Parameters
+    ----------
+    returns : pd.Series
+        Period returns (e.g., monthly returns in %)
+    n_bootstrap : int
+        Number of bootstrap samples
+    block_size : int
+        Block size in periods (default 6 = 6 months for monthly returns)
+    random_state : int
+        Random seed for reproducibility
+        
+    Returns
+    -------
+    dict
+        Bootstrap statistics with confidence intervals:
+        - sharpe_mean: Mean Sharpe from bootstrap distribution
+        - sharpe_ci_5: 5th percentile (lower bound of 90% CI)
+        - sharpe_ci_95: 95th percentile (upper bound of 90% CI)
+        - return_mean: Mean return from bootstrap distribution
+        - return_ci_5/95: Confidence intervals for returns
+    """
+    np.random.seed(random_state)
+    
+    if len(returns) < block_size * 2:
+        # Not enough data for bootstrap
+        return {
+            'sharpe_mean': np.nan,
+            'sharpe_ci_5': np.nan,
+            'sharpe_ci_95': np.nan,
+            'return_mean': np.nan,
+            'return_ci_5': np.nan,
+            'return_ci_95': np.nan,
+        }
+    
+    sharpe_dist = []
+    return_dist = []
+    
+    n_blocks = len(returns) // block_size
+    
+    for i in range(n_bootstrap):
+        # Sample blocks with replacement (block bootstrap)
+        sampled_blocks = np.random.choice(n_blocks, size=n_blocks, replace=True)
+        
+        bootstrap_returns = []
+        for block_idx in sampled_blocks:
+            start = block_idx * block_size
+            end = min(start + block_size, len(returns))
+            bootstrap_returns.extend(returns.iloc[start:end].values)
+        
+        # Compute statistics on bootstrapped sample
+        boot_mean = np.mean(bootstrap_returns)
+        boot_std = np.std(bootstrap_returns, ddof=1)  # Use sample std
+        
+        return_dist.append(boot_mean)
+        
+        if boot_std > 0:
+            sharpe = boot_mean / boot_std
+            sharpe_dist.append(sharpe)
+    
+    # Compute confidence intervals
+    return {
+        'sharpe_mean': np.mean(sharpe_dist),
+        'sharpe_ci_5': np.percentile(sharpe_dist, 5),
+        'sharpe_ci_95': np.percentile(sharpe_dist, 95),
+        'return_mean': np.mean(return_dist),
+        'return_ci_5': np.percentile(return_dist, 5),
+        'return_ci_95': np.percentile(return_dist, 95),
+    }
+
+
+def attribution_analysis(
+    results_df: pd.DataFrame,
+    panel_df: pd.DataFrame,
+    universe_metadata: pd.DataFrame,
+    config: ResearchConfig
+) -> Dict:
+    """
+    Comprehensive attribution analysis to understand return drivers.
+    
+    Analyzes:
+    1. Feature attribution: Which features contribute most to returns?
+    2. Sector/cluster attribution: Which themes drive performance?
+    3. Long/short attribution: Performance breakdown by side
+    4. Regime attribution: Performance by market regime
+    5. IC decay: Out-of-sample IC vs in-sample IC
+    
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Backtest results with columns: date, long_ret, short_ret, etc.
+    panel_df : pd.DataFrame
+        Full panel with MultiIndex (Date, Ticker)
+    universe_metadata : pd.DataFrame
+        ETF metadata with cluster_id
+    config : ResearchConfig
+        Configuration
+        
+    Returns
+    -------
+    dict
+        Attribution breakdowns
+    """
+    attribution = {}
+    
+    # ===== 1. Long/Short Attribution (already available) =====
+    attribution['long_short'] = {
+        'long_mean': results_df['long_ret'].mean(),
+        'short_mean': results_df['short_ret'].mean(),
+        'long_std': results_df['long_ret'].std(),
+        'short_std': results_df['short_ret'].std(),
+        'long_sharpe': results_df['long_ret'].mean() / results_df['long_ret'].std() if results_df['long_ret'].std() > 0 else 0,
+        'short_sharpe': results_df['short_ret'].mean() / results_df['short_ret'].std() if results_df['short_ret'].std() > 0 else 0,
+    }
+    
+    # ===== 2. Regime Attribution =====
+    if 'regime' in results_df.columns:
+        regime_stats = results_df.groupby('regime').agg({
+            'ls_return': ['mean', 'std', 'count'],
+            'long_ret': 'mean',
+            'short_ret': 'mean'
+        }).to_dict()
+        attribution['regime'] = regime_stats
+    else:
+        attribution['regime'] = None
+    
+    # ===== 3. Sector/Cluster Attribution =====
+    # Aggregate returns by cluster
+    cluster_attribution = {}
+    target_col = f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}'
+    
+    if target_col in panel_df.columns and 'cluster_id' in universe_metadata.columns:
+        # Set index properly for metadata lookup
+        if 'ticker' in universe_metadata.columns:
+            meta_idx = universe_metadata.set_index('ticker')
+        else:
+            meta_idx = universe_metadata
+        
+        for idx, row in results_df.iterrows():
+            t0 = row['date']
+            
+            # Get long positions
+            if 'long_tickers' in row and isinstance(row['long_tickers'], list):
+                for ticker in row['long_tickers']:
+                    if ticker in meta_idx.index:
+                        cluster = meta_idx.loc[ticker, 'cluster_id']
+                        
+                        # Get actual return
+                        if (t0, ticker) in panel_df.index:
+                            ret = panel_df.loc[(t0, ticker), target_col]
+                            
+                            if cluster not in cluster_attribution:
+                                cluster_attribution[cluster] = []
+                            cluster_attribution[cluster].append(ret)
+        
+        # Aggregate by cluster
+        cluster_summary = {
+            cluster: {
+                'mean_ret': np.mean(rets),
+                'count': len(rets)
+            }
+            for cluster, rets in cluster_attribution.items()
+            if len(rets) > 0
+        }
+        
+        attribution['cluster'] = cluster_summary
+    else:
+        attribution['cluster'] = None
+    
+    # ===== 4. Feature Attribution (IC-based) =====
+    # For each selected feature across all periods, compute correlation with returns
+    feature_ic = {}
+    
+    # Get all binned features that were used
+    binned_features = [col for col in panel_df.columns if col.endswith('_Bin')]
+    
+    if len(binned_features) > 0 and target_col in panel_df.columns:
+        for feat in binned_features:
+            # Compute overall IC (out-of-sample, since we only evaluate on scoring dates)
+            valid_mask = panel_df[feat].notna() & panel_df[target_col].notna()
+            
+            if valid_mask.sum() > 10:
+                from scipy.stats import spearmanr
+                ic, pval = spearmanr(
+                    panel_df.loc[valid_mask, feat],
+                    panel_df.loc[valid_mask, target_col]
+                )
+                feature_ic[feat] = {
+                    'ic': ic,
+                    'pval': pval,
+                    'n': valid_mask.sum()
+                }
+        
+        attribution['feature_ic'] = feature_ic
+    else:
+        attribution['feature_ic'] = None
+    
+    # ===== 5. IC Decay Analysis =====
+    # Compare in-sample IC (training) vs out-of-sample IC (scoring)
+    # This requires storing IC values during training, which we'll track
+    if 'ic_values' in results_df.columns:
+        # If we stored IC values per period
+        attribution['ic_decay'] = {
+            'mean_ic': results_df['ic_values'].mean() if 'ic_values' in results_df.columns else None,
+            'std_ic': results_df['ic_values'].std() if 'ic_values' in results_df.columns else None,
+        }
+    else:
+        attribution['ic_decay'] = None
+    
+    return attribution
+
+
+def print_attribution_report(attribution: Dict):
+    """
+    Print formatted attribution analysis report.
+    
+    Parameters
+    ----------
+    attribution : dict
+        Attribution dictionary from attribution_analysis()
+    """
+    print("\n" + "="*80)
+    print("ATTRIBUTION ANALYSIS")
+    print("="*80)
+    
+    # Long/Short Attribution
+    if 'long_short' in attribution and attribution['long_short']:
+        print("\n1. LONG/SHORT ATTRIBUTION")
+        print("-" * 40)
+        ls = attribution['long_short']
+        print(f"Long  : {ls['long_mean']:>6.2f}% mean, {ls['long_std']:>5.2f}% std, Sharpe={ls['long_sharpe']:>5.2f}")
+        print(f"Short : {ls['short_mean']:>6.2f}% mean, {ls['short_std']:>5.2f}% std, Sharpe={ls['short_sharpe']:>5.2f}")
+    
+    # Regime Attribution
+    if 'regime' in attribution and attribution['regime']:
+        print("\n2. REGIME ATTRIBUTION")
+        print("-" * 40)
+        print("(Regime-based performance breakdown)")
+        # TODO: Format regime stats nicely
+    
+    # Cluster Attribution
+    if 'cluster' in attribution and attribution['cluster']:
+        print("\n3. SECTOR/CLUSTER ATTRIBUTION (Top 10)")
+        print("-" * 40)
+        clusters = attribution['cluster']
+        # Sort by mean return
+        sorted_clusters = sorted(clusters.items(), key=lambda x: x[1]['mean_ret'], reverse=True)[:10]
+        for cluster, stats in sorted_clusters:
+            print(f"{cluster:30s}: {stats['mean_ret']:>6.2f}% (n={stats['count']})")
+    
+    # Feature IC
+    if 'feature_ic' in attribution and attribution['feature_ic']:
+        print("\n4. FEATURE ATTRIBUTION (Top 10 by |IC|)")
+        print("-" * 40)
+        feat_ic = attribution['feature_ic']
+        # Sort by absolute IC
+        sorted_feats = sorted(feat_ic.items(), key=lambda x: abs(x[1]['ic']), reverse=True)[:10]
+        for feat, stats in sorted_feats:
+            print(f"{feat:30s}: IC={stats['ic']:>6.3f}, p={stats['pval']:>6.4f}, n={stats['n']}")
+    
+    # IC Decay
+    if 'ic_decay' in attribution and attribution['ic_decay']:
+        print("\n5. IC DECAY ANALYSIS")
+        print("-" * 40)
+        decay = attribution['ic_decay']
+        if decay['mean_ic'] is not None:
+            print(f"Mean IC: {decay['mean_ic']:.3f}")
+            print(f"Std IC:  {decay['std_ic']:.3f}")
+    
+    print("\n" + "="*80)
+
+
 def analyze_performance(results_df: pd.DataFrame, config: ResearchConfig) -> Dict:
     """
     Compute performance statistics.
@@ -634,6 +946,14 @@ def analyze_performance(results_df: pd.DataFrame, config: ResearchConfig) -> Dic
     long_mean = results_df['long_ret'].mean()
     short_mean = results_df['short_ret'].mean()
     
+    # Bootstrap confidence intervals
+    bootstrap_stats = bootstrap_performance_stats(
+        returns,
+        n_bootstrap=1000,
+        block_size=6,
+        random_state=config.features.random_state if hasattr(config.features, 'random_state') else 42
+    )
+    
     stats = {
         'Total Periods': total_periods,
         'Win Rate': f"{win_rate:.2%}",
@@ -647,6 +967,11 @@ def analyze_performance(results_df: pd.DataFrame, config: ResearchConfig) -> Dic
         'Max Drawdown': f"{max_dd:.2f}%",
         'Long Avg': f"{long_mean:.2f}%",
         'Short Avg': f"{short_mean:.2f}%",
+        # Bootstrap confidence intervals
+        'Sharpe (Bootstrap Mean)': f"{bootstrap_stats['sharpe_mean']:.2f}",
+        'Sharpe 90% CI': f"[{bootstrap_stats['sharpe_ci_5']:.2f}, {bootstrap_stats['sharpe_ci_95']:.2f}]",
+        'Return (Bootstrap Mean)': f"{bootstrap_stats['return_mean']:.2f}%",
+        'Return 90% CI': f"[{bootstrap_stats['return_ci_5']:.2f}%, {bootstrap_stats['return_ci_95']:.2f}%]",
     }
     
     return stats

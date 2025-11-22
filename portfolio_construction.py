@@ -571,11 +571,11 @@ def evaluate_portfolio_return(
     #   - Example: 100% long with 50% margin:
     #     * Post 50% margin (our capital)
     #     * Borrow 50% (from broker)
-    #     * Pay interest on 50% borrowed
+    #     * Pay MARGIN INTEREST on 50% borrowed
     #   - Example: 150% long with 50% margin:
     #     * Post 75% margin (50% of 150% position)
     #     * Borrow 75% (remaining 150% - 75%)
-    #     * Pay interest on 75% borrowed
+    #     * Pay MARGIN INTEREST on 75% borrowed
     #   - Borrowed amount = gross_long × (1 - margin_req)
     # 
     # For SHORT positions (security borrowing):
@@ -584,27 +584,35 @@ def evaluate_portfolio_return(
     #   - Margin requirement determines COLLATERAL needed (not interest base)
     #   - Example: 50% short with 50% margin:
     #     * Collateral posted: 25% of capital (50% × 50%)
-    #     * Interest paid on: 50% of capital (full notional)
+    #     * SHORT BORROW FEE paid on: 50% of capital (full notional)
     # 
-    # Cost = borrow_cost × borrowed_notional × (holding_days / 365)
+    # CRITICAL: Use SEPARATE rates for shorts vs longs
+    #   - Short borrow fee: cost to borrow shares (paid to share lender)
+    #   - Margin interest: cost to borrow cash (paid to broker)
+    # 
+    # Cost = rate × borrowed_notional × (holding_days / 365)
     # NOTE: Use 365 calendar days for consistent annual rate conversion
     
-    borrow_cost_ret = 0.0
+    short_borrow_cost = 0.0
+    margin_interest_cost = 0.0
     
-    # Borrowing cost for longs (borrow the unfunded portion)
+    # Margin interest for longs (borrow the unfunded portion)
     if gross_long > 0:
         # We post (margin_req × gross_long) as collateral
         # We borrow the rest: gross_long × (1 - margin_req)
         borrowed_long = gross_long * (1.0 - config.portfolio.long_margin_req)
-        borrow_cost_ret += (config.portfolio.borrow_cost * 
-                           borrowed_long * 
-                           (config.time.HOLDING_PERIOD_DAYS / 365.0))
+        margin_interest_cost = (config.portfolio.margin_interest_rate * 
+                               borrowed_long * 
+                               (config.time.HOLDING_PERIOD_DAYS / 365.0))
     
-    # Borrowing cost for shorts (on full notional, not margin-adjusted)
+    # Short borrow fee (on full notional, not margin-adjusted)
     if gross_short > 0:
-        borrow_cost_ret += (config.portfolio.borrow_cost * 
-                           gross_short * 
-                           (config.time.HOLDING_PERIOD_DAYS / 365.0))
+        short_borrow_cost = (config.portfolio.short_borrow_rate * 
+                            gross_short * 
+                            (config.time.HOLDING_PERIOD_DAYS / 365.0))
+    
+    # Total financing cost
+    borrow_cost_ret = short_borrow_cost + margin_interest_cost
     
     # Total return (long + short + cash - transaction costs - borrow costs)
     ls_return = long_ret + short_ret + cash_ret - transaction_cost - borrow_cost_ret
@@ -659,9 +667,11 @@ def evaluate_portfolio_return(
         'borrowed_short': gross_short,  # Always full notional for shorts
         'total_borrowed': (gross_long * (1.0 - config.portfolio.long_margin_req) if gross_long > 0 else 0.0) + gross_short,
         
-        # Interest and costs (as % return for the period)
+        # Financing costs breakdown (as % return for the period)
         'cash_interest_earned': cash_ret,  # Interest on uninvested cash
-        'borrowing_cost_charged': borrow_cost_ret,  # Cost of borrowed funds
+        'short_borrow_cost': short_borrow_cost,  # Fee to borrow shares for shorting
+        'margin_interest_cost': margin_interest_cost,  # Interest on cash borrowed for longs
+        'borrowing_cost_charged': borrow_cost_ret,  # Total = short_borrow + margin_interest
         'net_financing_cost': cash_ret - borrow_cost_ret,  # Net of interest earned - costs paid
         
         # Transaction costs

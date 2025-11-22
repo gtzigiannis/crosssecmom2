@@ -792,20 +792,58 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     # -------------------------------------------------------------------------
     # 2. Download OHLCV data
     # -------------------------------------------------------------------------
+    # IMPORTANT: All ETF data is downloaded starting from config.time.start_date
+    # (recommended: 2007-11-04 for full ETF history). Filtering is applied LATER
+    # in the walk-forward engine based on:
+    #
+    # ETF FILTERING CRITERIA (applied at each rebalance date):
+    # ========================================================
+    # 1. Core Universe Filter (in_core_after_duplicates == True):
+    #    - Removes leveraged ETFs (e.g., TQQQ, SQQQ)
+    #    - Removes inverse ETFs 
+    #    - Removes non-canonical duplicates (keeps one ETF per duplicate group)
+    #
+    # 2. Liquidity Filter (ADV_63_Rank >= min_adv_percentile):
+    #    - Default: 30th percentile (top 70% by liquidity)
+    #    - Uses 63-day average dollar volume
+    #    - Cross-sectional rank computed at each date
+    #
+    # 3. Data Quality Filter (non-NaN features >= min_data_quality):
+    #    - Default: 80% of features must be non-NaN
+    #    - Ensures sufficient data for model scoring
+    #
+    # 4. History Requirement (sufficient historical data):
+    #    - Each ticker must have FEATURE_MAX_LAG_DAYS + TRAINING_WINDOW_DAYS
+    #      of historical data before entering the eligible universe
+    #    - Default: 252 + 1260 = 1512 days (~6 years)
+    #    - This ensures we can calculate features AND train models
+    #
+    # Note: ETFs are added to the eligible universe as soon as they meet
+    # all 4 criteria, allowing new ETFs to enter over time.
+    # ========================================================
+    
     print("\n[2/8] Downloading OHLCV data...")
+    print(f"[download] All ETFs will be downloaded from {config.time.start_date} to {config.time.end_date}")
+    print(f"[download] Filtering will be applied during walk-forward backtest")
+    
+    download_start = time.time()
     data_dict = download_etf_data(
         tickers,
         config.time.start_date,
         config.time.end_date
     )
+    download_elapsed = time.time() - download_start
     
     if len(data_dict) == 0:
         raise RuntimeError("No data downloaded!")
+    
+    print(f"[time] Data download completed in {download_elapsed:.2f} seconds ({download_elapsed/60:.2f} minutes)")
     
     # -------------------------------------------------------------------------
     # 2.5. Download macro data (NEW)
     # -------------------------------------------------------------------------
     print("\n[2.5/8] Downloading macro data...")
+    macro_start = time.time()
     data_manager = CrossSecMomDataManager(config.paths.data_dir)
     macro_tickers = {
         'vix': '^VIX',         # VIX volatility index
@@ -819,16 +857,21 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
         start_date=config.time.start_date,
         end_date=config.time.end_date
     )
+    macro_elapsed = time.time() - macro_start
+    print(f"[time] Macro data download completed in {macro_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
     # 3. Feature engineering (parallel)
     # -------------------------------------------------------------------------
     print("\n[3/8] Engineering features per ticker...")
     
+    feature_eng_start = time.time()
     results = Parallel(n_jobs=config.compute.n_jobs, backend='threading', verbose=5)(
         delayed(process_ticker)(ticker, data_dict[ticker], config.universe.adv_window)
         for ticker in data_dict.keys()
     )
+    feature_eng_elapsed = time.time() - feature_eng_start
+    print(f"[time] Feature engineering completed in {feature_eng_elapsed:.2f} seconds ({feature_eng_elapsed/60:.2f} minutes)")
     
     # -------------------------------------------------------------------------
     # 4. Combine into panel structure
@@ -858,26 +901,41 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     # 5. Add forward returns
     # -------------------------------------------------------------------------
     print("\n[5/8] Computing forward returns...")
+    fwd_ret_start = time.time()
     panel_df = panel_df.reset_index()
     panel_df = add_forward_returns(panel_df, config.time.HOLDING_PERIOD_DAYS)
+    fwd_ret_elapsed = time.time() - fwd_ret_start
+    print(f"[time] Forward returns computed in {fwd_ret_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
     # 6. Add cross-sectional features (NEW from crosssecmom)
     # -------------------------------------------------------------------------
     print("\n[6/8] Adding relative return features...")
+    rel_ret_start = time.time()
     panel_df = add_relative_return_features(panel_df, lookbacks=[5, 20, 60])
+    rel_ret_elapsed = time.time() - rel_ret_start
+    print(f"[time] Relative return features added in {rel_ret_elapsed:.2f} seconds")
     
     print("\n[7/8] Adding correlation features...")
+    corr_start = time.time()
     panel_df = add_correlation_features(panel_df, window=20)
+    corr_elapsed = time.time() - corr_start
+    print(f"[time] Correlation features added in {corr_elapsed:.2f} seconds")
     
     print("\n[7.5/8] Adding asset type flags...")
+    asset_start = time.time()
     panel_df = add_asset_type_flags(panel_df, config)
+    asset_elapsed = time.time() - asset_start
+    print(f"[time] Asset type flags added in {asset_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
     # 7.6. Add macro features (NEW)
     # -------------------------------------------------------------------------
     print("\n[7.6/8] Adding macro/regime features...")
+    macro_feat_start = time.time()
     panel_df = add_macro_features(panel_df, macro_data, config)
+    macro_feat_elapsed = time.time() - macro_feat_start
+    print(f"[time] Macro features added in {macro_feat_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
     # 8. Add ADV rank for filtering

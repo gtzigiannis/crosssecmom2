@@ -26,6 +26,7 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Tuple
 from sklearn.tree import DecisionTreeRegressor
+from sklearn.model_selection import KFold
 from scipy.stats import spearmanr
 import warnings
 
@@ -200,10 +201,15 @@ class SupervisedBinnedModel(AlphaModel):
         
         # Compute scores
         if self.feature_weights is not None:
-            # Weighted combination
+            # Weighted combination with IC sign handling
+            # CRITICAL: IC sign determines ranking direction
+            #   Positive IC: high feature → rank high → good (normal)
+            #   Negative IC: high feature → rank low → bad (flip by using negative weight)
             scores = pd.Series(0.0, index=cross_section.index)
             for feat in available_features:
+                # Always rank ascending (0 to 1)
                 feat_rank = cross_section[feat].rank(pct=True, method='average')
+                # Weight is SIGNED IC - negative weights flip the contribution
                 weight = self.feature_weights.get(feat, 1.0)
                 scores += weight * feat_rank
         else:
@@ -334,6 +340,93 @@ def compute_ic(
     return ic
 
 
+def compute_cv_ic(
+    feature_values: pd.Series,
+    target_values: pd.Series,
+    config,
+    n_splits: int = 5
+) -> float:
+    """
+    Compute cross-validated IC to prevent overfitting in feature selection.
+    
+    For binned features:
+    1. Split training data into K folds
+    2. For each fold:
+       - Fit bins on K-1 folds
+       - Compute IC on held-out fold using those bins
+    3. Return mean IC across folds
+    
+    For raw features:
+    - Simply compute IC on each fold directly
+    - Return mean IC across folds
+    
+    Parameters
+    ----------
+    feature_values : pd.Series
+        Raw feature values (will be binned if necessary)
+    target_values : pd.Series
+        Target values (FwdRet_H) aligned with features
+    config : ResearchConfig
+        Configuration for binning parameters
+    n_splits : int
+        Number of CV folds (default 5)
+        
+    Returns
+    -------
+    float
+        Mean IC across folds (out-of-sample)
+    """
+    # Remove NaN
+    valid_mask = feature_values.notna() & target_values.notna()
+    X = feature_values[valid_mask].values
+    y = target_values[valid_mask].values
+    idx = feature_values[valid_mask].index
+    
+    if len(X) < n_splits * 10:
+        # Insufficient data for CV, fall back to simple IC
+        return compute_ic(
+            pd.Series(X, index=idx),
+            pd.Series(y, index=idx),
+            method='spearman'
+        )
+    
+    # K-Fold cross-validation
+    kf = KFold(n_splits=n_splits, shuffle=False)  # No shuffle to preserve time order
+    fold_ics = []
+    
+    for train_idx, test_idx in kf.split(X):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        
+        # Fit bins on training fold
+        boundaries = fit_supervised_bins(
+            pd.Series(X_train),
+            pd.Series(y_train),
+            max_depth=config.features.bin_max_depth,
+            min_samples_leaf=config.features.bin_min_samples_leaf,
+            n_bins=config.features.n_bins,
+            random_state=config.features.random_state
+        )
+        
+        # Apply bins to test fold
+        X_test_binned = np.digitize(X_test, boundaries, right=False)
+        
+        # Compute IC on test fold
+        if len(X_test) > 2:
+            ic = compute_ic(
+                pd.Series(X_test_binned),
+                pd.Series(y_test),
+                method='spearman'
+            )
+            fold_ics.append(ic)
+    
+    # Return mean IC across folds
+    if len(fold_ics) > 0:
+        return np.mean(fold_ics)
+    else:
+        return 0.0
+
+
 def train_alpha_model(
     panel: pd.DataFrame,
     universe_metadata: pd.DataFrame,
@@ -457,8 +550,8 @@ def train_alpha_model(
     
     print(f"[train] Created {len(binning_dict)} binned features")
     
-    # ===== 2. Feature selection via IC =====
-    print(f"[train] Computing ICs for feature selection...")
+    # ===== 2. Feature selection via CV-IC (out-of-sample IC to prevent overfitting) =====
+    print(f"[train] Computing cross-validated ICs for feature selection...")
     
     # ===== AUTO-DISCOVER base features if not specified =====
     if config.features.base_features is None:
@@ -476,7 +569,7 @@ def train_alpha_model(
     else:
         base_features = config.features.base_features
     
-    # Candidate features = base features + binned features
+    # Candidate features = base features only (binned features will be evaluated via CV)
     candidate_features = []
     
     # Add base features that exist
@@ -484,50 +577,72 @@ def train_alpha_model(
         if feat in train_data.columns:
             candidate_features.append(feat)
     
-    # Add binned features
-    for feat in binning_dict.keys():
-        binned_name = f'{feat}_Bin'
-        if binned_name in train_data.columns:
-            candidate_features.append(binned_name)
-    
-    # Compute IC for each candidate
-    ic_values = {}
+    # Compute CV-IC for each candidate (includes binning in CV loop)
+    cv_ic_values = {}
     for feat in candidate_features:
-        ic = compute_ic(train_data[feat], train_data[target_col], method='spearman')
-        ic_values[feat] = ic
+        cv_ic = compute_cv_ic(
+            train_data[feat],
+            train_data[target_col],
+            config,
+            n_splits=5
+        )
+        cv_ic_values[feat] = cv_ic
     
-    ic_series = pd.Series(ic_values).dropna()
+    cv_ic_series = pd.Series(cv_ic_values).dropna()
     
-    # Select features with |IC| >= threshold
-    abs_ic = ic_series.abs()
-    selected_mask = abs_ic >= config.features.ic_threshold
-    selected_features = abs_ic[selected_mask].nlargest(config.features.max_features).index.tolist()
+    # Select features with |CV-IC| >= threshold
+    abs_cv_ic = cv_ic_series.abs()
+    selected_mask = abs_cv_ic >= config.features.ic_threshold
+    selected_features = abs_cv_ic[selected_mask].nlargest(config.features.max_features).index.tolist()
     
     if len(selected_features) == 0:
-        warnings.warn("No features passed IC threshold, using momentum rank")
+        warnings.warn("No features passed CV-IC threshold, using momentum rank")
         baseline_feature = 'Close%-63'
         return (MomentumRankModel(feature=baseline_feature), 
                 [baseline_feature], 
                 pd.Series({baseline_feature: np.nan}))
     
-    print(f"[train] Selected {len(selected_features)} features by IC")
-    print(f"[train] Top 5 by |IC|: {abs_ic[selected_features].nlargest(5).to_dict()}")
+    print(f"[train] Selected {len(selected_features)} features by CV-IC")
+    print(f"[train] Top 5 by |CV-IC|: {abs_cv_ic[selected_features].nlargest(5).to_dict()}")
     
-    # ===== 3. Feature weights (IC-weighted combination) =====
-    # Use IC as weights (higher |IC| = higher weight)
-    feature_weights = ic_series[selected_features].abs()
-    feature_weights = feature_weights / feature_weights.sum()  # Normalize to sum to 1
+    # Now create binned versions of selected features on FULL training data
+    # Only use binned version if base feature was already binned
+    final_features = []
+    for feat in selected_features:
+        if feat in binning_dict:
+            # Feature was binned, use binned version
+            binned_name = f'{feat}_Bin'
+            if binned_name in train_data.columns:
+                final_features.append(binned_name)
+        else:
+            # Feature was not binned, use raw version
+            final_features.append(feat)
+    
+    # ===== 3. Feature weights (CV-IC-weighted combination) =====
+    # CRITICAL: Store SIGNED IC values to preserve direction
+    # Positive IC: high feature values → high returns (rank ascending)
+    # Negative IC: high feature values → low returns (rank descending / flip sign)
+    # Map weights from selected_features to final_features
+    feature_weights_dict = {}
+    for i, feat in enumerate(selected_features):
+        final_feat = final_features[i]
+        # Store SIGNED IC (not absolute value!)
+        feature_weights_dict[final_feat] = cv_ic_series[feat]
+    
+    feature_weights = pd.Series(feature_weights_dict)
+    # Normalize by absolute values (preserve sign)
+    feature_weights = feature_weights / abs(feature_weights).sum()
     
     # ===== 4. Create model object =====
     model = SupervisedBinnedModel(
         binning_dict=binning_dict,
-        selected_features=selected_features,
+        selected_features=final_features,  # Use final_features (with _Bin suffix where applicable)
         feature_weights=feature_weights,
-        feature_ics=ic_series
+        feature_ics=cv_ic_series  # Store CV-IC values for diagnostics
     )
     
     # Return model along with diagnostics
-    return model, selected_features, ic_series
+    return model, selected_features, cv_ic_series
 
 
 if __name__ == "__main__":

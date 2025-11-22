@@ -172,7 +172,7 @@ def apply_hysteresis(
 
 def compute_regime_series(
     panel_df: pd.DataFrame,
-    config: RegimeConfig,
+    config: "RegimeConfig",
     verbose: bool = False
 ) -> pd.Series:
     """

@@ -6,7 +6,7 @@ All paths, time parameters, and thresholds are defined here.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict
 from pathlib import Path
 
 
@@ -34,8 +34,8 @@ class TimeConfig:
     """Time structure parameters for walk-forward research."""
     
     # Data range
-    start_date: str = "2015-01-01"
-    end_date: str = "2025-11-19"
+    start_date: str = "2007-11-04"  # Start date for yfinance download
+    end_date: str = "2025-11-10"  # End date
     
     # Walk-forward parameters (all in trading days)
     FEATURE_MAX_LAG_DAYS: int = 252  # Longest lookback in feature construction (1 year)
@@ -73,20 +73,38 @@ class PortfolioConfig:
     """Portfolio construction parameters."""
     
     # Position sizing
-    long_quantile: float = 0.9   # Top 10% for long portfolio
-    short_quantile: float = 0.1  # Bottom 10% for short portfolio
-    long_leverage: float = 1.0    # Long leverage: target long position / capital
-                                  # 1.0 = 100% long (no leverage), 1.5 = 150% long (50% borrowed)
-                                  # When levered, you deploy 100% capital + borrow additional cash
-    short_notional: float = 0.50  # Target short exposure as fraction of capital
-                                  # 0.5 = short up to 50% of capital
-                                  # This is position SIZE, not margin requirement
+    long_quantile: float = 0.8   # Top 10% for long portfolio
+    short_quantile: float = 0.2  # Bottom 10% for short portfolio
     
-    # Margin requirements (collateral needed for positions)
-    long_margin_req: float = 0.50   # Margin requirement for longs (Reg T = 50%)
-                                     # 50% means you need 50% collateral for 100% position
-    short_margin_req: float = 0.50  # Margin requirement for shorts (typically 50% for ETFs)
-                                     # 50% means you need 50% collateral for 100% short position
+    # === DEPRECATED (kept for backward compatibility) ===
+    long_leverage: float = 1.0    # DEPRECATED: Use margin regime instead
+                                  # 1.0 = 100% long (no leverage), 1.5 = 150% long (50% borrowed)
+    short_notional: float = 0.50  # DEPRECATED: Use margin regime instead
+                                  # 0.5 = short up to 50% of capital
+    
+    # === Margin Regime (NEW - recommended) ===
+    # Choose margin regime: "reg_t_initial", "reg_t_maintenance", or "portfolio"
+    margin_regime: str = "reg_t_maintenance"  # Most realistic for held positions
+    
+    # Reg T Initial Margins (50%/50% - most conservative, for opening positions)
+    reg_t_initial_long: float = 0.50
+    reg_t_initial_short: float = 0.50
+    
+    # Reg T Maintenance Margins (25%/30% - realistic for held positions)
+    reg_t_maint_long: float = 0.25   # 25% maintenance for long ETF positions
+    reg_t_maint_short: float = 0.30  # 30% maintenance for short ETF positions
+    
+    # Portfolio Margin (risk-based - requires $100k account, lower margins)
+    portfolio_margin_long: float = 0.15   # Typical for diversified ETF portfolio
+    portfolio_margin_short: float = 0.15  # Typical for diversified ETF portfolio
+    
+    # === Dollar-Neutral Constraint ===
+    enforce_dollar_neutral: bool = True   # True = long exposure = short exposure
+    long_short_ratio: float = 1.0         # Only used if enforce_dollar_neutral=False
+    
+    # === DEPRECATED Margin Requirements (kept for backward compatibility) ===
+    long_margin_req: float = 0.50   # DEPRECATED: Use margin_regime instead
+    short_margin_req: float = 0.50  # DEPRECATED: Use margin_regime instead
     
     # Portfolio mode
     long_only: bool = False      # If True, only construct long positions (cash otherwise)
@@ -98,10 +116,14 @@ class PortfolioConfig:
     commission_bps: float = 2.0  # Commission in basis points per side (0-2 bps typical)
     slippage_bps: float = 8.0    # Slippage + market impact per side (5-10 bps for liquid ETFs)
     
-    # Borrowing costs
-    borrow_cost: float = 0.05    # Annual borrowing cost (5% typical)
-                                 # For longs: paid on borrowed amount (if long_leverage > 1.0)
-                                 # For shorts: paid on FULL notional shorted (not margin-adjusted)
+    # === Financing Costs (NEW - separate rates for shorts vs longs) ===
+    short_borrow_rate: float = 0.055      # Annual rate to borrow shares for shorting (5.5%)
+                                          # Paid on FULL notional of short positions
+    margin_interest_rate: float = 0.055   # Annual interest rate on cash borrowed for leverage (5.5%)
+                                          # Paid on borrowed portion of long positions
+    
+    # DEPRECATED: Use short_borrow_rate and margin_interest_rate instead
+    borrow_cost: float = 0.055    # DEPRECATED: Now split into separate rates above
     
     # Risk limits (default caps)
     default_cluster_cap: float = 0.10  # 10% max per theme cluster
@@ -131,6 +153,128 @@ class PortfolioConfig:
                 "COMMODITY_ENERGY",
                 "ALT_CRYPTO"
             }
+        
+        # Emit deprecation warnings for old parameters
+        import warnings
+        if hasattr(self, '_warned_deprecation'):
+            return  # Only warn once
+        self._warned_deprecation = True
+        
+        # Check if user is relying on deprecated parameters
+        if self.long_leverage != 1.0 or self.short_notional != 0.50:
+            warnings.warn(
+                "\n" + "="*80 + "\n"
+                "DEPRECATION WARNING: long_leverage and short_notional are deprecated.\n"
+                "\n"
+                "Please migrate to the new margin regime system:\n"
+                "  - Use 'margin_regime' to select: 'reg_t_initial', 'reg_t_maintenance', or 'portfolio'\n"
+                "  - Use 'enforce_dollar_neutral=True' for cross-sectional momentum (default)\n"
+                "  - Separate financing costs: 'short_borrow_rate' and 'margin_interest_rate'\n"
+                "\n"
+                "Your current settings will continue to work but may produce different leverage.\n"
+                "Recommended: Set margin_regime='reg_t_maintenance' for realistic ETF trading.\n"
+                + "="*80,
+                DeprecationWarning,
+                stacklevel=3
+            )
+    
+    def get_active_margins(self) -> tuple:
+        """Return active margin requirements based on margin regime.
+        
+        Returns
+        -------
+        tuple of (float, float)
+            (margin_long, margin_short) - margin requirements as fractions
+        
+        Examples
+        --------
+        >>> config.margin_regime = 'reg_t_maintenance'
+        >>> margin_long, margin_short = config.get_active_margins()
+        >>> # margin_long = 0.25, margin_short = 0.30
+        """
+        if self.margin_regime == "reg_t_initial":
+            return self.reg_t_initial_long, self.reg_t_initial_short
+        elif self.margin_regime == "reg_t_maintenance":
+            return self.reg_t_maint_long, self.reg_t_maint_short
+        elif self.margin_regime == "portfolio":
+            return self.portfolio_margin_long, self.portfolio_margin_short
+        else:
+            # Fallback to deprecated parameters
+            import warnings
+            warnings.warn(
+                f"Unknown margin regime '{self.margin_regime}'. "
+                f"Falling back to long_margin_req={self.long_margin_req}, "
+                f"short_margin_req={self.short_margin_req}",
+                UserWarning
+            )
+            return self.long_margin_req, self.short_margin_req
+    
+    def compute_max_exposure(self, capital: float = 1.0) -> Dict[str, float]:
+        """Calculate maximum dollar-neutral exposure given margin constraints.
+        
+        This implements the core leverage constraint from the instructions:
+        For dollar-neutral strategy (long = short):
+            max_position = capital / (margin_long + margin_short)
+        
+        Parameters
+        ----------
+        capital : float, default 1.0
+            Initial capital (typically 1.0 for percentage-based weights)
+        
+        Returns
+        -------
+        dict with keys:
+            - long_exposure: Maximum dollar value of long positions
+            - short_exposure: Maximum dollar value of short positions (absolute)
+            - gross_exposure: Total exposure (long + short)
+            - gross_leverage: Gross exposure / capital
+            - net_exposure: Long - short (should be ~0 for dollar-neutral)
+            - margin_long: Active long margin requirement
+            - margin_short: Active short margin requirement
+            - long_borrowed: Amount of cash borrowed to finance longs
+            - short_proceeds: Cash received from short sales (held as collateral)
+            - margin_posted: Total margin posted to broker
+        
+        Examples
+        --------
+        >>> # Reg T maintenance: 25% long, 30% short
+        >>> config.margin_regime = 'reg_t_maintenance'
+        >>> result = config.compute_max_exposure(capital=100)
+        >>> result['long_exposure']   # 100 / (0.25 + 0.30) = 181.82
+        >>> result['gross_leverage']  # 363.64 / 100 = 3.64x
+        """
+        margin_long, margin_short = self.get_active_margins()
+        
+        if self.enforce_dollar_neutral:
+            # Dollar-neutral: L = S = capital / (margin_long + margin_short)
+            max_position = capital / (margin_long + margin_short)
+            long_exp = max_position
+            short_exp = max_position
+        else:
+            # User-specified ratio (e.g., 130/30 fund)
+            # Total capital constraint: margin_long * L + margin_short * S <= capital
+            # With ratio constraint: L / S = long_short_ratio
+            # Solve: L = capital * long_short_ratio / (margin_long * long_short_ratio + margin_short)
+            ratio = self.long_short_ratio
+            long_exp = capital * ratio / (margin_long * ratio + margin_short)
+            short_exp = long_exp / ratio
+        
+        # Calculate borrowing amounts
+        long_borrowed = long_exp * (1.0 - margin_long) if long_exp > 0 else 0.0
+        short_proceeds = short_exp  # Full notional from short sales
+        
+        return {
+            'long_exposure': long_exp,
+            'short_exposure': short_exp,
+            'gross_exposure': long_exp + short_exp,
+            'gross_leverage': (long_exp + short_exp) / capital if capital > 0 else 0.0,
+            'net_exposure': long_exp - short_exp,
+            'margin_long': margin_long,
+            'margin_short': margin_short,
+            'long_borrowed': long_borrowed,
+            'short_proceeds': short_proceeds,
+            'margin_posted': capital
+        }
 
 
 @dataclass
@@ -152,7 +296,7 @@ class FeatureConfig:
     # Binning parameters
     bin_max_depth: int = 3            # Max depth for decision tree binning
     bin_min_samples_leaf: int = 100   # Min samples per leaf
-    n_bins: int = 10                  # Target number of bins
+    n_bins: int = 8                  # Target number of bins
     
     # Reproducibility
     random_state: Optional[int] = 42  # Random seed for reproducible results
@@ -278,6 +422,41 @@ class ResearchConfig:
         assert self.time.HOLDING_PERIOD_DAYS > 0, "HOLDING_PERIOD_DAYS must be positive"
         assert self.time.STEP_DAYS > 0, "STEP_DAYS must be positive"
         
+        # Date range validation
+        import pandas as pd
+        start_date = pd.to_datetime(self.time.start_date)
+        end_date = pd.to_datetime(self.time.end_date)
+        date_range_days = (end_date - start_date).days
+        
+        # Minimum data required for strategy to run
+        # = FEATURE_MAX_LAG (for feature calculation) 
+        # + TRAINING_WINDOW (for model training)
+        # + HOLDING_PERIOD (for forward returns)
+        # + buffer for walk-forward steps
+        min_required_days = self.time.FEATURE_MAX_LAG_DAYS + self.time.TRAINING_WINDOW_DAYS + self.time.HOLDING_PERIOD_DAYS + 100
+        
+        if date_range_days < min_required_days:
+            import warnings
+            warnings.warn(
+                f"\n" + "="*80 + "\n"
+                f"WARNING: Date range may be insufficient for strategy execution!\n"
+                f"\n"
+                f"Current date range: {self.time.start_date} to {self.time.end_date} ({date_range_days} days)\n"
+                f"Minimum required: {min_required_days} trading days\n"
+                f"\n"
+                f"Required for:\n"
+                f"  - Feature calculation (max lag): {self.time.FEATURE_MAX_LAG_DAYS} days\n"
+                f"  - Model training window: {self.time.TRAINING_WINDOW_DAYS} days\n"
+                f"  - Forward return horizon: {self.time.HOLDING_PERIOD_DAYS} days\n"
+                f"  - Walk-forward buffer: 100 days\n"
+                f"\n"
+                f"Recommendation: Set start_date to at least {(end_date - pd.Timedelta(days=min_required_days)).strftime('%Y-%m-%d')}\n"
+                f"                or earlier (2007-11-04 recommended for full ETF history)\n"
+                + "="*80,
+                UserWarning,
+                stacklevel=2
+            )
+        
         # Universe filters
         assert 0 < self.universe.min_adv_percentile < 1, "min_adv_percentile must be in (0, 1)"
         assert 0 < self.universe.min_data_quality <= 1, "min_data_quality must be in (0, 1]"
@@ -289,12 +468,35 @@ class ResearchConfig:
         assert self.portfolio.short_notional >= 0, "short_notional must be non-negative"
         assert 0 < self.portfolio.long_margin_req <= 1, "long_margin_req must be in (0, 1]"
         assert 0 < self.portfolio.short_margin_req <= 1, "short_margin_req must be in (0, 1]"
+        
+        # Validate margin regime
+        valid_regimes = {"reg_t_initial", "reg_t_maintenance", "portfolio"}
+        if self.portfolio.margin_regime not in valid_regimes:
+            import warnings
+            warnings.warn(
+                f"Unknown margin_regime '{self.portfolio.margin_regime}'. "
+                f"Valid options: {valid_regimes}. Using fallback to long_margin_req/short_margin_req.",
+                UserWarning
+            )
+        
+        # Validate margin parameters
+        assert 0 < self.portfolio.reg_t_initial_long <= 1, "reg_t_initial_long must be in (0, 1]"
+        assert 0 < self.portfolio.reg_t_initial_short <= 1, "reg_t_initial_short must be in (0, 1]"
+        assert 0 < self.portfolio.reg_t_maint_long <= 1, "reg_t_maint_long must be in (0, 1]"
+        assert 0 < self.portfolio.reg_t_maint_short <= 1, "reg_t_maint_short must be in (0, 1]"
+        assert 0 < self.portfolio.portfolio_margin_long <= 1, "portfolio_margin_long must be in (0, 1]"
+        assert 0 < self.portfolio.portfolio_margin_short <= 1, "portfolio_margin_short must be in (0, 1]"
+        
         assert not (self.portfolio.long_only and self.portfolio.short_only), \
             "Cannot set both long_only and short_only to True"
         assert self.portfolio.cash_rate >= 0, "cash_rate must be non-negative"
         assert self.portfolio.commission_bps >= 0, "commission_bps must be non-negative"
         assert self.portfolio.slippage_bps >= 0, "slippage_bps must be non-negative"
-        assert self.portfolio.borrow_cost >= 0, "borrow_cost must be non-negative"
+        
+        # Validate financing costs
+        assert self.portfolio.short_borrow_rate >= 0, "short_borrow_rate must be non-negative"
+        assert self.portfolio.margin_interest_rate >= 0, "margin_interest_rate must be non-negative"
+        assert self.portfolio.borrow_cost >= 0, "borrow_cost must be non-negative (deprecated)"
         
         # Feature config
         assert self.features.ic_threshold >= 0, "ic_threshold must be non-negative"
