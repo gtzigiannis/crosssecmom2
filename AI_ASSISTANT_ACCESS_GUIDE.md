@@ -23,6 +23,9 @@ Use these URLs to access files directly without HTML rendering:
 **Documentation:**
 ```
 https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/README.md
+https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/LEVERAGE_FIXES_SUMMARY.md
+https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/CDO_PERFORMANCE_INVESTIGATION.md
+https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/AI_ASSISTANT_ACCESS_GUIDE.md
 ```
 
 **Main Entry Point:**
@@ -45,10 +48,36 @@ https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/universe_metadat
 https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/regime.py
 ```
 
-**Test Files:**
+**Verification Scripts:**
 ```
-https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/TEST_ADVANCED_FIXES.py
+https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/verify_accounting.py
 https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/setup.py
+```
+
+### How to Access ANY File in the Repository
+
+**URL Pattern:**
+```
+https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/<file_path>
+```
+
+**Examples:**
+- Root file: `https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/config.py`
+- Subdirectory: `https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/docs/architecture.md`
+- Python package: `https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/src/models/momentum.py`
+
+**For Branch-Specific Access:**
+```
+https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/<branch_name>/<file_path>
+```
+
+**Complete File Listing via API:**
+```bash
+# Get repository tree (all files)
+curl https://api.github.com/repos/gtzigiannis/crosssecmom2/git/trees/main?recursive=1
+
+# Parse with jq to list all files
+curl -s https://api.github.com/repos/gtzigiannis/crosssecmom2/git/trees/main?recursive=1 | jq -r '.tree[].path'
 ```
 
 ---
@@ -59,25 +88,74 @@ https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/setup.py
 
 ```
 crosssecmom2/
-├── config.py                    # Configuration parameters
-├── regime.py                    # Market regime detection
-├── universe_metadata.py         # ETF universe management
-├── feature_engineering.py       # Feature generation
-├── alpha_models.py              # Model training & scoring
-├── portfolio_construction.py    # Portfolio optimization
-├── walk_forward_engine.py       # Backtesting engine
-├── main.py                      # CLI entry point
-├── TEST_ADVANCED_FIXES.py       # Test suite
-└── README.md                    # Complete documentation
+├── config.py                         # Configuration parameters
+├── regime.py                         # Market regime detection
+├── universe_metadata.py              # ETF universe management
+├── feature_engineering.py            # Feature generation
+├── alpha_models.py                   # Model training & scoring
+├── portfolio_construction.py         # Portfolio optimization
+├── walk_forward_engine.py            # Backtesting engine
+├── main.py                           # CLI entry point
+├── verify_accounting.py              # Accounting verification script
+├── README.md                         # Complete documentation
+├── LEVERAGE_FIXES_SUMMARY.md         # Technical fix documentation
+├── CDO_PERFORMANCE_INVESTIGATION.md  # Performance analysis
+└── AI_ASSISTANT_ACCESS_GUIDE.md      # This file
 ```
 
 ### Key Information
 
 - **Strategy Type**: Cross-sectional momentum on 116 ETFs
 - **Language**: Python 3.8+
-- **Main Dependencies**: pandas, numpy, scikit-learn, yfinance
-- **Test Framework**: Python unittest
+- **Main Dependencies**: pandas, numpy, scikit-learn, yfinance, cvxpy (optional)
+- **Data Location**: `D:\REPOSITORY\Data\crosssecmom2\`
 - **Documentation**: Comprehensive README with mathematical details
+
+### Accessing File Contents
+
+**Method 1: Direct Raw URLs** (Recommended)
+```python
+# Pattern: https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{filepath}
+url = "https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/config.py"
+
+# Access in code:
+import requests
+content = requests.get(url).text
+```
+
+**Method 2: GitHub API**
+```bash
+# Get file content with metadata
+curl -H "Accept: application/vnd.github.v3+json" \
+  https://api.github.com/repos/gtzigiannis/crosssecmom2/contents/config.py
+
+# Returns base64-encoded content + metadata
+```
+
+**Method 3: List All Files Programmatically**
+```python
+import requests
+
+# Get complete file tree
+response = requests.get(
+    "https://api.github.com/repos/gtzigiannis/crosssecmom2/git/trees/main?recursive=1"
+)
+tree = response.json()
+
+# Extract all file paths
+files = [item['path'] for item in tree['tree'] if item['type'] == 'blob']
+
+# Build raw URLs for each file
+for filepath in files:
+    raw_url = f"https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/{filepath}"
+    print(f"{filepath}: {raw_url}")
+```
+
+**Method 4: Clone Locally** (For extensive access)
+```bash
+git clone https://github.com/gtzigiannis/crosssecmom2.git
+cd crosssecmom2
+```
 
 ---
 
@@ -103,7 +181,7 @@ crosssecmom2/
 For AI assistants helping with this repository, use this template:
 
 ```
-I need help with the crosssecmom2 repository. Here's the structure:
+I need help with the crosssecmom2 repository (cross-sectional momentum strategy on 116 ETFs).
 
 Repository: https://github.com/gtzigiannis/crosssecmom2
 
@@ -112,7 +190,40 @@ Key files to review:
 2. Config: https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/config.py
 3. [Specific file]: https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/[filename]
 
+Context:
+- Strategy: Cross-sectional momentum on 116 ETFs (2011-2025)
+- Status: FIX 0-5 complete (accounting & leverage verified correct)
+- Performance: -69% return, 39% win rate (MODEL issue, not accounting bug)
+- Investigation: See CDO_PERFORMANCE_INVESTIGATION.md for analysis framework
+
 My question: [Your question here]
+```
+
+### Quick Access to Key Documentation
+
+**For Understanding the Strategy:**
+```
+https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/README.md
+```
+
+**For Understanding Recent Fixes:**
+```
+https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/LEVERAGE_FIXES_SUMMARY.md
+```
+
+**For Understanding Performance Issues:**
+```
+https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/CDO_PERFORMANCE_INVESTIGATION.md
+```
+
+**For Accessing Code:**
+```bash
+# Core modules (raw URLs)
+CONFIG="https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/config.py"
+FEATURES="https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/feature_engineering.py"
+PORTFOLIO="https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/portfolio_construction.py"
+BACKTEST="https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/walk_forward_engine.py"
+MODELS="https://raw.githubusercontent.com/gtzigiannis/crosssecmom2/main/alpha_models.py"
 ```
 
 ---
