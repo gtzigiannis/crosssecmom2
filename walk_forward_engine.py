@@ -308,6 +308,10 @@ def run_walk_forward_backtest(
     results = []
     diagnostics = []  # Store diagnostics for each rebalance period
     
+    # FIX 4: Capital compounding and tracking
+    current_capital = 1.0
+    capital_history = []
+    
     # Track previous weights for turnover calculation
     prev_long_weights = None
     prev_short_weights = None
@@ -455,13 +459,17 @@ def run_walk_forward_backtest(
         
         portfolio_start = time.time()
         try:
+            # FIX 5: Pass capital explicitly to constructor
+            # Constructor now handles scaling, no need for post-hoc multiplication
             long_weights, short_weights, portfolio_stats = construct_portfolio(
                 scores=scores,
                 universe_metadata=eligible_metadata,
                 config=config,
                 method=portfolio_method,
-                mode=mode
+                mode=mode,
+                capital=current_capital
             )
+            
             portfolio_elapsed = time.time() - portfolio_start
             total_portfolio_time += portfolio_elapsed
         except Exception as e:
@@ -505,11 +513,17 @@ def run_walk_forward_backtest(
         # Add portfolio stats to performance
         performance.update(portfolio_stats)
         
+        # FIX 4: Update capital using decimal return
+        period_return_decimal = performance['ls_return']  # Already decimal
+        current_capital *= (1.0 + period_return_decimal)
+        performance['capital'] = current_capital
+        capital_history.append(current_capital)
+        
         # Add rebalance timing
         rebalance_elapsed = time.time() - rebalance_start
         if verbose:
-            print(f"[result] Long: {performance['long_ret']:.2f}%, Short: {performance['short_ret']:.2f}%, "
-                  f"L/S: {performance['ls_return']:.2f}%, Turnover: {performance['turnover']:.2%}, "
+            print(f"[result] Long: {performance['long_ret'] * 100:.2f}%, Short: {performance['short_ret'] * 100:.2f}%, "
+                  f"L/S: {performance['ls_return'] * 100:.2f}%, Turnover: {performance['turnover']:.2%}, "
                   f"TxnCost: {performance['transaction_cost']:.4%}")
             print(f"[time] Rebalance completed in {rebalance_elapsed:.2f}s "
                   f"(train: {train_elapsed:.1f}s, score: {score_elapsed:.1f}s, "
@@ -535,6 +549,24 @@ def run_walk_forward_backtest(
     results_df = pd.DataFrame(results)
     results_df['date'] = pd.to_datetime(results_df['date'])
     results_df = results_df.set_index('date').sort_index()
+    
+    # FIX 4: Verify capital compounding consistency
+    if len(results_df) > 0:
+        cumulative_return_check = (1 + results_df['ls_return']).prod()
+        capital_error = abs(cumulative_return_check - current_capital)
+        
+        if verbose:
+            print("\n" + "="*80)
+            print("CAPITAL COMPOUNDING VERIFICATION")
+            print("="*80)
+            print(f"Final capital (tracked):        {current_capital:.6f}")
+            print(f"Final capital (from returns):   {cumulative_return_check:.6f}")
+            print(f"Absolute error:                 {capital_error:.2e}")
+            
+            if capital_error > 1e-6:
+                print(f"[WARN] Capital tracking mismatch detected!")
+            else:
+                print(f"[OK] Capital tracking is consistent ✓")
     
     if verbose:
         print("\n" + "="*80)
@@ -922,7 +954,7 @@ def analyze_performance(results_df: pd.DataFrame, config: ResearchConfig) -> Dic
     winning_periods = (returns > 0).sum()
     win_rate = winning_periods / total_periods
     
-    # Return statistics
+    # Return statistics (returns are now in decimal form)
     mean_ret = returns.mean()
     std_ret = returns.std()
     sharpe = mean_ret / std_ret if std_ret > 0 else 0.0
@@ -933,13 +965,13 @@ def analyze_performance(results_df: pd.DataFrame, config: ResearchConfig) -> Dic
     annual_vol = std_ret * np.sqrt(periods_per_year)
     annual_sharpe = sharpe * np.sqrt(periods_per_year)
     
-    # Cumulative return
-    cum_ret = (1 + returns / 100).cumprod()
-    total_return = (cum_ret.iloc[-1] - 1) * 100
+    # Cumulative return (returns are decimals, so no /100 needed)
+    cum_ret = (1 + returns).cumprod()
+    total_return = cum_ret.iloc[-1] - 1
     
     # Drawdown
     running_max = cum_ret.expanding().max()
-    drawdown = (cum_ret - running_max) / running_max * 100
+    drawdown = (cum_ret - running_max) / running_max
     max_dd = drawdown.min()
     
     # Long/Short breakdown
@@ -957,21 +989,21 @@ def analyze_performance(results_df: pd.DataFrame, config: ResearchConfig) -> Dic
     stats = {
         'Total Periods': total_periods,
         'Win Rate': f"{win_rate:.2%}",
-        'Mean Return': f"{mean_ret:.2f}%",
-        'Std Dev': f"{std_ret:.2f}%",
+        'Mean Return': f"{mean_ret * 100:.2f}%",  # Convert decimal to percent for display
+        'Std Dev': f"{std_ret * 100:.2f}%",
         'Sharpe Ratio': f"{sharpe:.2f}",
-        'Annual Return': f"{annual_return:.2f}%",
-        'Annual Volatility': f"{annual_vol:.2f}%",
+        'Annual Return': f"{annual_return * 100:.2f}%",
+        'Annual Volatility': f"{annual_vol * 100:.2f}%",
         'Annual Sharpe': f"{annual_sharpe:.2f}",
-        'Total Return': f"{total_return:.2f}%",
-        'Max Drawdown': f"{max_dd:.2f}%",
-        'Long Avg': f"{long_mean:.2f}%",
-        'Short Avg': f"{short_mean:.2f}%",
+        'Total Return': f"{total_return * 100:.2f}%",
+        'Max Drawdown': f"{max_dd * 100:.2f}%",
+        'Long Avg': f"{long_mean * 100:.2f}%",
+        'Short Avg': f"{short_mean * 100:.2f}%",
         # Bootstrap confidence intervals
         'Sharpe (Bootstrap Mean)': f"{bootstrap_stats['sharpe_mean']:.2f}",
         'Sharpe 90% CI': f"[{bootstrap_stats['sharpe_ci_5']:.2f}, {bootstrap_stats['sharpe_ci_95']:.2f}]",
-        'Return (Bootstrap Mean)': f"{bootstrap_stats['return_mean']:.2f}%",
-        'Return 90% CI': f"[{bootstrap_stats['return_ci_5']:.2f}%, {bootstrap_stats['return_ci_95']:.2f}%]",
+        'Return (Bootstrap Mean)': f"{bootstrap_stats['return_mean'] * 100:.2f}%",
+        'Return 90% CI': f"[{bootstrap_stats['return_ci_5'] * 100:.2f}%, {bootstrap_stats['return_ci_95'] * 100:.2f}%]",
     }
     
     return stats

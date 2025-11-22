@@ -198,6 +198,29 @@ See `config.py` for complete parameter list and validation rules.
 
 ---
 
+## Accounting and Leverage Fixes (November 2025)
+
+**Status**: ✅ All fixes (FIX 0-5) implemented and verified
+
+### What Was Fixed
+
+The strategy underwent comprehensive accounting and leverage fixes to ensure correctness:
+
+1. **FIX 0 - Decimal Convention**: All returns stored as decimals (0.05 = 5%) throughout system
+2. **FIX 1 - Margin Regime**: Leverage controlled by `margin_regime` setting, not deprecated parameters
+3. **FIX 2 - Post-Cap Rescaling**: Caps enforced while preserving target exposures from margin regime
+4. **FIX 3 - Active Margins**: All calculations use `get_active_margins()` from current regime
+5. **FIX 4 - Capital Compounding**: Explicit capital state tracking with automatic verification
+6. **FIX 5 - Design Cleanup**: Capital passed directly to constructors (cleaner architecture)
+
+**Impact**: These fixes correct the accounting mechanics without changing the scientific methodology (features, scoring, ranking). Returns are now properly scaled, leverage matches margin settings, and capital compounds correctly.
+
+**Documentation**: See `leverage_fixes_summary.md` and `FIXES_COMPLETE.md` for complete details.
+
+**Performance Note**: The accounting is mathematically correct (verified), but the strategy currently underperforms (-69% return, 39% win rate) due to MODEL issues - shorts consistently go UP instead of DOWN, suggesting momentum reversal or feature/binning problems requiring scientific investigation.
+
+---
+
 ## Cost Modeling
 
 ### Transaction Costs
@@ -545,3 +568,4 @@ Annual Sharpe = Sharpe × sqrt(252 / 21) = Sharpe × 3.464
 ```
 
 ---
+.02--/

@@ -392,11 +392,12 @@ def add_forward_returns(panel_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     """
     print(f"[fwd] Computing forward returns for horizon: {horizon}")
     
-    # Compute forward returns per ticker
+    # Compute forward returns per ticker (as decimals, not percent)
+    # CRITICAL: +5% return is stored as 0.05, not 5.0
     panel_df[f'FwdRet_{horizon}'] = (
         panel_df.groupby('Ticker')['Close']
         .pct_change(horizon)
-        .shift(-horizon) * 100.0
+        .shift(-horizon)
     ).astype('float32')
     
     return panel_df

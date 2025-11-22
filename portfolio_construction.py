@@ -28,7 +28,8 @@ def construct_portfolio_simple(
     universe_metadata: pd.DataFrame,
     config,
     enforce_caps: bool = False,
-    mode: str = 'ls'
+    mode: str = 'ls',
+    capital: float = 1.0
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Simple portfolio construction: top/bottom quantiles with equal weights.
@@ -78,14 +79,10 @@ def construct_portfolio_simple(
     long_tickers = sorted_scores.head(n_long).index
     short_tickers = sorted_scores.tail(n_short).index
     
-    # Equal weights within each side
-    # IMPORTANT: 
-    # - Long positions scaled by long_leverage (target position size)
-    #   Example: long_leverage = 1.0 means 100% long position
-    # - Short positions scaled by short_notional (target short exposure)
-    #   Example: short_notional = 0.5 means 50% short position
-    long_leverage = config.portfolio.long_leverage
-    short_leverage = config.portfolio.short_notional
+    # FIX 1 & FIX 5: Use margin regime for exposure targets scaled by capital
+    max_exposure = config.portfolio.compute_max_exposure(capital=capital)
+    long_target_gross = max_exposure['long_exposure']
+    short_target_gross = max_exposure['short_exposure']
     
     # Determine which sides to build based on mode
     # Priority: explicit mode parameter > config.portfolio flags
@@ -109,15 +106,15 @@ def construct_portfolio_simple(
     else:
         raise ValueError(f"Invalid mode: {mode}. Must be 'ls', 'long_only', 'short_only', or 'cash'")
     
-    # Build long side
-    if build_long:
-        long_weights = pd.Series(long_leverage / n_long, index=long_tickers)
+    # Build long side with target exposure from margin regime
+    if build_long and n_long > 0:
+        long_weights = pd.Series(long_target_gross / n_long, index=long_tickers)
     else:
         long_weights = pd.Series(dtype=float)
     
-    # Build short side
-    if build_short:
-        short_weights = pd.Series(-short_leverage / n_short, index=short_tickers)
+    # Build short side with target exposure from margin regime
+    if build_short and n_short > 0:
+        short_weights = pd.Series(-short_target_gross / n_short, index=short_tickers)
     else:
         short_weights = pd.Series(dtype=float)
     
@@ -136,9 +133,15 @@ def construct_portfolio_simple(
             if abs(weights[ticker]) > cap:
                 weights[ticker] = cap * np.sign(weights[ticker])
     
-    # Renormalize
-    long_weights = long_weights / long_weights.sum() if long_weights.sum() > 0 else long_weights
-    short_weights = short_weights / abs(short_weights.sum()) if short_weights.sum() < 0 else short_weights
+    # FIX 2: Rescale to target exposures (not to 1.0)
+    # This preserves the leverage implied by compute_max_exposure
+    gross_long = long_weights.abs().sum() if len(long_weights) > 0 else 0.0
+    gross_short = short_weights.abs().sum() if len(short_weights) > 0 else 0.0
+    
+    if gross_long > 0:
+        long_weights = long_weights * (long_target_gross / gross_long)
+    if gross_short > 0:
+        short_weights = short_weights * (short_target_gross / gross_short)
     
     return long_weights, short_weights
 
@@ -147,7 +150,8 @@ def construct_portfolio_cvxpy(
     scores: pd.Series,
     universe_metadata: pd.DataFrame,
     config,
-    mode: str = 'ls'
+    mode: str = 'ls',
+    capital: float = 1.0
 ) -> Tuple[pd.Series, pd.Series]:
     """
     Portfolio construction with CVXPY optimization to enforce caps exactly.
@@ -203,6 +207,11 @@ def construct_portfolio_cvxpy(
     long_tickers = sorted_scores.head(n_long).index.tolist()
     short_tickers = sorted_scores.tail(n_short).index.tolist()
     
+    # FIX 1 & FIX 5: Use margin regime scaled by capital
+    max_exposure = config.portfolio.compute_max_exposure(capital=capital)
+    long_target_gross = max_exposure['long_exposure']
+    short_target_gross = max_exposure['short_exposure']
+    
     # Determine which sides to build based on mode
     if mode == 'short_only':
         build_long = False
@@ -225,9 +234,6 @@ def construct_portfolio_cvxpy(
         raise ValueError(f"Invalid mode: {mode}")
     
     # ===== Long portfolio =====
-    # Target gross exposure scaled by long_leverage (e.g., 1.0 = 100% of capital)
-    long_target_gross = config.portfolio.long_leverage
-    
     if not build_long:
         # Skip long portfolio
         long_weights = pd.Series(dtype=float)
@@ -244,10 +250,6 @@ def construct_portfolio_cvxpy(
         long_weights = pd.Series(dtype=float)
     
     # ===== Short portfolio =====
-    # Target gross exposure scaled by margin requirement
-    # With 50% margin, can only short up to 50% of capital
-    short_target_gross = config.portfolio.margin
-    
     if not build_short:
         # Skip short portfolio
         short_weights = pd.Series(dtype=float)
@@ -357,7 +359,8 @@ def construct_portfolio(
     universe_metadata: pd.DataFrame,
     config,
     method: str = 'cvxpy',
-    mode: str = 'ls'
+    mode: str = 'ls',
+    capital: float = 1.0
 ) -> Tuple[pd.Series, pd.Series, Dict]:
     """
     Main portfolio construction function.
@@ -374,6 +377,8 @@ def construct_portfolio(
         'cvxpy' (optimal) or 'simple' (fast approximation)
     mode : str
         Portfolio mode: 'ls' (long/short), 'long_only', 'short_only', 'cash'
+    capital : float
+        Current capital to scale portfolio by (default 1.0)
         
     Returns
     -------
@@ -383,10 +388,10 @@ def construct_portfolio(
         - portfolio_stats: Dict with diagnostics
     """
     if method == 'cvxpy' and CVXPY_AVAILABLE:
-        long_weights, short_weights = construct_portfolio_cvxpy(scores, universe_metadata, config, mode=mode)
+        long_weights, short_weights = construct_portfolio_cvxpy(scores, universe_metadata, config, mode=mode, capital=capital)
     else:
         long_weights, short_weights = construct_portfolio_simple(
-            scores, universe_metadata, config, enforce_caps=True, mode=mode
+            scores, universe_metadata, config, enforce_caps=True, mode=mode, capital=capital
         )
     
     # Compute portfolio statistics
@@ -499,9 +504,12 @@ def evaluate_portfolio_return(
     gross_long = long_weights.sum() if len(long_weights) > 0 else 0.0
     gross_short = abs(short_weights.sum()) if len(short_weights) > 0 else 0.0
     
+    # FIX 3: Use active margins from margin regime (not deprecated parameters)
+    margin_long, margin_short = config.portfolio.get_active_margins()
+    
     # Calculate capital tied up as margin
-    long_margin_capital = gross_long * config.portfolio.long_margin_req
-    short_margin_capital = gross_short * config.portfolio.short_margin_req
+    long_margin_capital = gross_long * margin_long
+    short_margin_capital = gross_short * margin_short
     total_margin_capital = long_margin_capital + short_margin_capital
     
     # Remaining cash (can be negative if insufficient capital!)
@@ -598,9 +606,10 @@ def evaluate_portfolio_return(
     
     # Margin interest for longs (borrow the unfunded portion)
     if gross_long > 0:
-        # We post (margin_req × gross_long) as collateral
-        # We borrow the rest: gross_long × (1 - margin_req)
-        borrowed_long = gross_long * (1.0 - config.portfolio.long_margin_req)
+        # We post (margin_long × gross_long) as collateral
+        # We borrow the rest: gross_long × (1 - margin_long)
+        margin_long, _ = config.portfolio.get_active_margins()
+        borrowed_long = gross_long * (1.0 - margin_long)
         margin_interest_cost = (config.portfolio.margin_interest_rate * 
                                borrowed_long * 
                                (config.time.HOLDING_PERIOD_DAYS / 365.0))
@@ -662,10 +671,10 @@ def evaluate_portfolio_return(
         'gross_short': gross_short,
         'net_exposure': gross_long - gross_short,
         
-        # Borrowing amounts
-        'borrowed_long': gross_long * (1.0 - config.portfolio.long_margin_req) if gross_long > 0 else 0.0,
+        # Borrowing amounts (using active margins)
+        'borrowed_long': gross_long * (1.0 - margin_long) if gross_long > 0 else 0.0,
         'borrowed_short': gross_short,  # Always full notional for shorts
-        'total_borrowed': (gross_long * (1.0 - config.portfolio.long_margin_req) if gross_long > 0 else 0.0) + gross_short,
+        'total_borrowed': (gross_long * (1.0 - margin_long) if gross_long > 0 else 0.0) + gross_short,
         
         # Financing costs breakdown (as % return for the period)
         'cash_interest_earned': cash_ret,  # Interest on uninvested cash
