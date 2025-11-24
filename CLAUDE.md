@@ -1,5 +1,42 @@
 # Claude AI Command Reference for crosssecmom2
 
+## MANDATORY DEVELOPMENT WORKFLOW
+
+**EVERY code change MUST follow this 3-step process:**
+
+1. **VALIDATE FIRST** - Test all changes with real data before anything else
+   - Run full pipeline from scratch (clear cache, feature_eng, backtest)
+   - Verify output files are generated correctly
+   - Check terminal output matches expectations
+   - Confirm calculations are correct
+   - **NEVER skip testing - NO EXCEPTIONS**
+
+2. **DOCUMENT SECOND** - Only document after validation proves it works
+   - Update relevant .md files with actual results (not hypothetical)
+   - Include real output examples from validation run
+   - Document any gotchas or edge cases discovered during testing
+   - Update CLAUDE.md if new commands or workflows are needed
+
+3. **COMMIT LAST** - Only commit after validation + documentation complete
+   - Stage changes: `git add .`
+   - Commit with descriptive message: `git commit -m "..."`
+   - Push to remote: `git push origin main`
+   - **NEVER commit untested code to main branch**
+
+**Why this order matters:**
+- Testing first catches bugs before they reach production
+- Documentation reflects reality, not aspirations
+- Git history contains only working, validated code
+- Rollback is easier when commits are tested
+
+**Past mistakes to avoid:**
+- ❌ Committing attribution system without testing it
+- ❌ Documenting win rates before validating them
+- ❌ Pushing code that was never executed
+- ✅ Always: Test → Document → Commit
+
+---
+
 ## CRITICAL: ALWAYS cd to the correct directory first!
 
 ```powershell
