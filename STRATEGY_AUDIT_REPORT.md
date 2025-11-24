@@ -1728,6 +1728,66 @@ FEATURE SELECTION LAYER (Phase 2)
 │   └── Output: 15-25 final features
 └── Bonferroni Correction: p-value threshold = 0.05 / 80 = 0.000625
 
+RISK MANAGEMENT LAYER (Phase 2)
+═══════════════════════════════════════════════════════════════════
+├── Configuration: RiskManagementConfig dataclass in config.py
+│   ├── enable_risk_management: bool = True
+│   ├── max_portfolio_drawdown: float = 0.10 (10% DD trigger)
+│   ├── position_stop_loss: float = 0.05 (5% position-level stop)
+│   ├── max_position_age: int = 42 (force exit after 42 days)
+│   ├── volatility_target: float = 0.10 (10% annualized vol)
+│   ├── enable_circuit_breaker: bool = True
+│   ├── circuit_breaker_threshold: float = 0.03 (3% intraday move)
+│   ├── cooling_off_period: int = 5 (days after circuit breaker)
+│   ├── enable_vol_targeting: bool = True
+│   └── max_leverage_limit: float = 2.0 (hard cap)
+│
+├── Portfolio-Level Controls:
+│   ├── Drawdown Monitor:
+│   │   ├── Track peak equity and current equity
+│   │   ├── If (peak - current) / peak > max_portfolio_drawdown:
+│   │   │   └── Reduce leverage to 0.3x until recovery
+│   │   └── Recovery: when equity reaches 95% of previous peak
+│   │
+│   ├── Volatility Targeting:
+│   │   ├── Calculate realized_vol = std(returns[-63:]) × sqrt(252)
+│   │   ├── vol_scalar = min(volatility_target / realized_vol, max_leverage_limit)
+│   │   └── adjusted_leverage = base_leverage × vol_scalar
+│   │
+│   └── Circuit Breaker:
+│       ├── If |intraday_return| > circuit_breaker_threshold:
+│       │   └── Flatten all positions, go to cash
+│       ├── Cooling off: No trading for cooling_off_period days
+│       └── Resume: After cooling period, rebuild positions gradually (20% per day)
+│
+├── Position-Level Controls:
+│   ├── Stop Loss:
+│   │   ├── Track entry price for each position
+│   │   ├── If position_return < -position_stop_loss:
+│   │   │   └── Exit position immediately at next rebalance
+│   │   └── Log: "Position [TICKER] stopped out at -5%"
+│   │
+│   ├── Max Position Age:
+│   │   ├── Track days_held for each position
+│   │   ├── If days_held > max_position_age:
+│   │   │   └── Force exit (prevent stale positions)
+│   │   └── Rationale: Momentum decays after 1-2 months
+│   │
+│   └── Position Sizing Adjustment:
+│       ├── If position in profit > +10%: Reduce size by 20% (take profits)
+│       └── If position near stop: Reduce size by 50% (defensive)
+│
+├── Implementation Location:
+│   ├── config.py: Add RiskManagementConfig dataclass
+│   ├── walk_forward_engine.py: Add risk_manager module integration
+│   ├── risk_manager.py (NEW): Implement all risk controls
+│   └── portfolio_construction.py: Apply risk adjustments to weights
+│
+└── Monitoring & Alerts:
+    ├── Log all risk events: stops, circuit breakers, drawdown triggers
+    ├── Emit warnings when approaching thresholds (90% of DD limit)
+    └── Generate risk report: days in drawdown, # stops triggered, vol scalar history
+
 SCORING LAYER (Phase 3 - IF Phase 0-2 succeed)
 ═══════════════════════════════════════════════════════════════════
 ├── Primary: IC-weighted linear combination 
@@ -1797,20 +1857,55 @@ SUCCESS METRICS
 
 ### 9.6 Implementation Timeline
 
-**Foundation (Phase 0)**
-- Implement target variable fixes (winsorize)
-- Fix leverage calculation, test equity-only universe
+**Foundation (Phase 0 - 2-3 days)**
+- Implement target variable fixes (winsorize at ±2.5σ)
+- Add IC stability filter (80%+ sign consistency)
+- Fix leverage calculation (reg_t_initial: 1.0x per side)
+- Test equity-only universe (60-70 ETFs)
 - Run diagnostic backtest, evaluate success criteria
-- Go/No-Go decision
+- **Go/No-Go decision:** If win rate < 51%, abandon strategy
 
-**Enhancement (Phase 2)** 
-- Implement Feature Engineering Improvements
-- Implement Feature Selection Improvements
+**Enhancement (Phase 1 - 3-4 days)** 
+- Add 10-15 interaction features (Mom×Vol, Mom×VIX, Mom_accel, etc.)
+- Add regime-conditional features (Mom_in_low_vol, Mom_in_high_vol)
+- Total feature count: 80+ features
+- Test feature engineering improvements
 
-**Optimization (Phase 3)**
-- Advanced scoring evaluation (stay linear vs ensemble)
-- Regime-based leverage scaling
+**Refinement (Phase 2 - 2-3 days)**
+- Implement two-stage feature selection:
+  * Stage 1a: IC stability filter
+  * Stage 1b: Multicollinearity removal via MI
+  * Stage 2: Top 15-25 features by |IC|
+- Add Bonferroni correction (p < 0.05/80)
+- **NEW: Implement RiskManagementConfig**:
+  * Add RiskManagementConfig dataclass to config.py
+  * Create risk_manager.py module with portfolio-level and position-level controls
+  * Integrate risk management into walk_forward_engine.py
+  * Add drawdown monitoring, stop losses, volatility targeting, circuit breakers
+  * Implement cooling-off periods and position age limits
+  * Add risk event logging and monitoring
+- Run backtest with improved features and risk controls
+- Evaluate: Win rate 55%+, Sharpe 1.2+
+
+**Optimization (Phase 3 - 3-4 days)** 
+- Evaluate scoring options:
+  * Option A: IC-weighted linear (BASELINE)
+  * Option B: LambdaMART ranking model
+  * Option C: Ensemble (XGB + LGBM + Linear)
+- Select best approach based on out-of-sample Sharpe
+- Implement regime-based leverage scaling (VIX-dependent)
+- Test adaptive leverage based on realized volatility
 - Final validation and robustness testing
+
+**Production Readiness (Phase 4 - 2-3 days)**
+- Add comprehensive logging (Python logging module)
+- Implement unit tests for critical paths
+- Add configuration versioning (track git commit in config)
+- Create production deployment checklist
+- Document all parameters and design decisions
+- Set up monitoring dashboards (risk metrics, performance, alerts)
+
+**Total Timeline: 12-17 days (2.5-3.5 weeks)**
 
 
 ### 9.7 Key Insights & Best Practices
@@ -1832,23 +1927,50 @@ SUCCESS METRICS
 
 **Risk 1: Momentum Crash**
 - Momentum strategies suffer sharp reversals during market reversals (2009, 2020)
-- **Mitigation:** VIX-based leverage scaling (reduce exposure in high vol)
+- **Mitigation:** 
+  * VIX-based leverage scaling (reduce exposure in high vol)
+  * RiskManagementConfig.circuit_breaker_threshold (3% intraday move → flatten positions)
+  * RiskManagementConfig.cooling_off_period (5 days recovery after circuit breaker)
 
 **Risk 2: Overfitting**
 - 96 monthly samples is limited data for complex models
-- **Mitigation:** Consider moving to weekly or daily data to increase sample size / statistical confidence
+- **Mitigation:** 
+  * Consider moving to weekly or daily data to increase sample size / statistical confidence
+  * Use IC stability filter (80%+ sign consistency) to avoid spurious features
+  * Bonferroni correction for multiple testing
 
 **Risk 3: Regime Change**
 - Momentum may fail in prolonged mean-reverting markets (2022-2023)
-- **Mitigation:** Monitor rolling win rate, implement kill switch if large drawdowns, implement Risk Management layer (stop loss, cooling off periods etc)
+- **Mitigation:** 
+  * Monitor rolling win rate, implement kill switch if <45% over 12 months
+  * RiskManagementConfig.max_portfolio_drawdown (10% → reduce leverage to 0.3x)
+  * RiskManagementConfig enables systematic drawdown management
 
 **Risk 4: Data Quality**
 - Asset prices can have stale quotes, especially for low-volume tickers
-- **Mitigation:** Require $5M+ daily volume, 80%+ data coverage
+- **Mitigation:** 
+  * Require $5M+ daily volume, 80%+ data coverage
+  * Universe filters enforce strict data quality requirements
 
 **Risk 5: Transaction Costs (FUTURE enhancement)**
 - 8 bps cost assumption may be optimistic for low-liquidity ETFs
-- **Mitigation:** Model slippage as function of spread + volume, not flat 5 bps
+- **Mitigation:** 
+  * Model slippage as function of spread + volume, not flat 5 bps
+  * Add bid-ask spread features to feature set (let model learn cost-awareness)
+
+**Risk 6: Position-Level Blow-Ups (NEW - Addressed in Phase 2)**
+- Individual positions can experience large drawdowns without portfolio-level circuit breaker
+- **Mitigation:**
+  * RiskManagementConfig.position_stop_loss (5% position-level stop)
+  * RiskManagementConfig.max_position_age (42 days → force exit stale positions)
+  * Position-level monitoring and automatic exit on breach
+
+**Risk 7: Volatility Spikes (NEW - Addressed in Phase 2)**
+- Strategy volatility can exceed target during market stress
+- **Mitigation:**
+  * RiskManagementConfig.enable_vol_targeting (dynamically adjust leverage)
+  * RiskManagementConfig.volatility_target (10% annualized vol target)
+  * Realized vol calculated over 63-day trailing window, leverage scaled accordingly
 
 ---
 
