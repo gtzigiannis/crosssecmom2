@@ -794,6 +794,309 @@ def add_asset_type_flags(panel_df: pd.DataFrame, config: ResearchConfig) -> pd.D
     return panel_df
 
 # ============================================================================
+# PHASE 1: EXHAUSTIVE INTERACTION FEATURES
+# ============================================================================
+
+def generate_interaction_features(panel_df: pd.DataFrame, config: ResearchConfig) -> pd.DataFrame:
+    """
+    PHASE 1: Generate ALL mathematically valid interaction features.
+    
+    Philosophy:
+    - EXHAUSTIVE, not heuristic (do NOT handpick based on "gut feel")
+    - Generate ALL logical combinations, let feature selection decide
+    - "engineer as many logical combinations as possible and let feature selection 
+       decide if they fit - do not try to frontrun the statistical test"
+    
+    Interaction Types:
+    1. Multiplicative: Mom×Mom, Mom×Vol, Mom×Macro, Mom×Oscillator, Vol×Macro
+    2. Ratio: Mom/Vol, Mom/ADV, Vol/Vol (risk-adjusted returns)
+    3. Difference: Mom acceleration, Vol regime shifts
+    4. Polynomial: Mom^2, Mom^3, Vol^2 (non-linear effects)
+    5. Regime-Conditional: feature × regime_flag
+    
+    Target: 300-500 total features (96 base + 200-400 interactions)
+    
+    Args:
+        panel_df: Panel data with base features
+        config: Research configuration
+        
+    Returns:
+        Panel data with base + interaction features
+    """
+    print("[interaction] Starting exhaustive interaction feature generation...")
+    print(f"[interaction] Base feature count: {len(panel_df.columns)}")
+    
+    # Identify base feature categories (exclude Close, FwdRet_21, Date, Ticker)
+    exclude_cols = {'Close', 'FwdRet_21', 'Date', 'Ticker', 'ADV_63_Rank'}
+    all_cols = [c for c in panel_df.columns if c not in exclude_cols]
+    
+    # Categorize features by mathematical properties
+    momentum_features = [c for c in all_cols if any(x in c for x in ['Close%-', 'Mom', 'lag'])]
+    volatility_features = [c for c in all_cols if any(x in c for x in ['std', 'ATR'])]
+    oscillator_features = [c for c in all_cols if any(x in c for x in ['RSI', 'Williams'])]
+    trend_features = [c for c in all_cols if any(x in c for x in ['MA', 'EMA', 'Boll'])]
+    macd_features = [c for c in all_cols if 'MACD' in c]
+    higher_moments = [c for c in all_cols if any(x in c for x in ['skew', 'kurt'])]
+    hurst_features = [c for c in all_cols if 'Hurst' in c]
+    drawdown_features = [c for c in all_cols if 'DD' in c]
+    shock_features = [c for c in all_cols if 'Ret1dZ' in c]
+    liquidity_features = [c for c in all_cols if c in ['ADV_63']]  # Always positive
+    macro_features = [c for c in all_cols if any(x in c for x in ['vix_', 'yc_', 'short_rate', 'credit_proxy'])]
+    regime_flags = [c for c in all_cols if any(x in c for x in ['crash_flag', 'meltup_flag', 'high_vol', 'low_vol'])]
+    relative_features = [c for c in all_cols if 'Rel' in c and 'vs' in c]
+    correlation_features = [c for c in all_cols if 'Corr' in c]
+    
+    print(f"[interaction] Momentum features: {len(momentum_features)}")
+    print(f"[interaction] Volatility features: {len(volatility_features)}")
+    print(f"[interaction] Oscillator features: {len(oscillator_features)}")
+    print(f"[interaction] Macro features: {len(macro_features)}")
+    print(f"[interaction] Regime flags: {len(regime_flags)}")
+    
+    interaction_count = 0
+    
+    # =========================================================================
+    # Type 1: MULTIPLICATIVE INTERACTIONS (Products)
+    # =========================================================================
+    print("\n[interaction] Type 1: Multiplicative (products)...")
+    
+    # 1.1 Momentum × Momentum (all pairs)
+    print("  [1.1] Mom × Mom (all pairs)...")
+    for i, feat1 in enumerate(momentum_features):
+        for feat2 in momentum_features[i+1:]:  # Avoid duplicates (A×B = B×A)
+            new_col = f"{feat1}_x_{feat2}"
+            panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+            interaction_count += 1
+    print(f"      Generated {interaction_count} Mom×Mom interactions")
+    
+    # 1.2 Momentum × Volatility (all pairs)
+    print("  [1.2] Mom × Vol (all pairs)...")
+    start_count = interaction_count
+    for feat1 in momentum_features:
+        for feat2 in volatility_features:
+            new_col = f"{feat1}_x_{feat2}"
+            panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+            interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} Mom×Vol interactions")
+    
+    # 1.3 Momentum × Macro (all pairs)
+    print("  [1.3] Mom × Macro (all pairs)...")
+    start_count = interaction_count
+    for feat1 in momentum_features:
+        for feat2 in macro_features:
+            new_col = f"{feat1}_x_{feat2}"
+            panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+            interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} Mom×Macro interactions")
+    
+    # 1.4 Momentum × Oscillator (all pairs)
+    print("  [1.4] Mom × Oscillator (all pairs)...")
+    start_count = interaction_count
+    for feat1 in momentum_features:
+        for feat2 in oscillator_features:
+            new_col = f"{feat1}_x_{feat2}"
+            panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+            interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} Mom×Oscillator interactions")
+    
+    # 1.5 Volatility × Macro (all pairs)
+    print("  [1.5] Vol × Macro (all pairs)...")
+    start_count = interaction_count
+    for feat1 in volatility_features:
+        for feat2 in macro_features:
+            new_col = f"{feat1}_x_{feat2}"
+            panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+            interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} Vol×Macro interactions")
+    
+    # 1.6 Momentum × Relative (all pairs)
+    print("  [1.6] Mom × Relative (all pairs)...")
+    start_count = interaction_count
+    for feat1 in momentum_features:
+        for feat2 in relative_features:
+            new_col = f"{feat1}_x_{feat2}"
+            panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+            interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} Mom×Relative interactions")
+    
+    # =========================================================================
+    # Type 2: RATIO INTERACTIONS (Division)
+    # =========================================================================
+    print("\n[interaction] Type 2: Ratio (division, denominator > 0)...")
+    
+    # 2.1 Momentum / Volatility (Sharpe-like ratios)
+    print("  [2.1] Mom / Vol (risk-adjusted returns)...")
+    start_count = interaction_count
+    for feat1 in momentum_features:
+        for feat2 in volatility_features:
+            new_col = f"{feat1}_div_{feat2}"
+            # Avoid division by zero: replace vol=0 with NaN
+            denominator = panel_df[feat2].replace(0, np.nan)
+            panel_df[new_col] = (panel_df[feat1] / denominator).astype('float32')
+            interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} Mom/Vol ratios")
+    
+    # 2.2 Momentum / ADV (liquidity-adjusted returns)
+    if liquidity_features:
+        print("  [2.2] Mom / ADV (liquidity-adjusted returns)...")
+        start_count = interaction_count
+        for feat1 in momentum_features:
+            for feat2 in liquidity_features:
+                new_col = f"{feat1}_div_{feat2}"
+                denominator = panel_df[feat2].replace(0, np.nan)
+                panel_df[new_col] = (panel_df[feat1] / denominator).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Mom/ADV ratios")
+    
+    # 2.3 Volatility / Volatility (different horizons, vol regime shifts)
+    print("  [2.3] Vol / Vol (regime shifts)...")
+    start_count = interaction_count
+    for i, feat1 in enumerate(volatility_features):
+        for feat2 in volatility_features[i+1:]:
+            new_col = f"{feat1}_div_{feat2}"
+            denominator = panel_df[feat2].replace(0, np.nan)
+            panel_df[new_col] = (panel_df[feat1] / denominator).astype('float32')
+            interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} Vol/Vol ratios")
+    
+    # =========================================================================
+    # Type 3: DIFFERENCE INTERACTIONS (Subtraction)
+    # =========================================================================
+    print("\n[interaction] Type 3: Difference (acceleration, spreads)...")
+    
+    # 3.1 Momentum Acceleration (adjacent horizons)
+    print("  [3.1] Momentum acceleration (Mom_short - Mom_long)...")
+    start_count = interaction_count
+    # Define momentum hierarchy by lookback (short to long)
+    mom_hierarchy = [
+        'Close%-1', 'Close%-2', 'Close%-3', 'Close%-5', 'Close%-10',
+        'Close%-21', 'Close%-42', 'Close%-63', 'Close%-126', 'Close%-252'
+    ]
+    mom_available = [m for m in mom_hierarchy if m in momentum_features]
+    for i in range(len(mom_available) - 1):
+        feat1 = mom_available[i]      # Shorter horizon
+        feat2 = mom_available[i + 1]  # Longer horizon
+        new_col = f"{feat1}_minus_{feat2}"
+        panel_df[new_col] = (panel_df[feat1] - panel_df[feat2]).astype('float32')
+        interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} momentum acceleration features")
+    
+    # 3.2 Volatility Changes (adjacent horizons)
+    print("  [3.2] Volatility changes (Vol_short - Vol_long)...")
+    start_count = interaction_count
+    vol_hierarchy = ['Close_std5', 'Close_std10', 'Close_std21', 'Close_std42', 'Close_std63', 'Close_std126']
+    vol_available = [v for v in vol_hierarchy if v in volatility_features]
+    for i in range(len(vol_available) - 1):
+        feat1 = vol_available[i]      # Shorter horizon
+        feat2 = vol_available[i + 1]  # Longer horizon
+        new_col = f"{feat1}_minus_{feat2}"
+        panel_df[new_col] = (panel_df[feat1] - panel_df[feat2]).astype('float32')
+        interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} volatility change features")
+    
+    # =========================================================================
+    # Type 4: POLYNOMIAL TRANSFORMATIONS
+    # =========================================================================
+    print("\n[interaction] Type 4: Polynomial (squared, cubed)...")
+    
+    # 4.1 Momentum Squared (emphasize extremes, convex)
+    print("  [4.1] Momentum squared (convex)...")
+    start_count = interaction_count
+    for feat in momentum_features:
+        new_col = f"{feat}_sq"
+        panel_df[new_col] = (panel_df[feat] ** 2).astype('float32')
+        interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} momentum squared features")
+    
+    # 4.2 Momentum Cubed (preserve sign, emphasize tails)
+    print("  [4.2] Momentum cubed (tail emphasis)...")
+    start_count = interaction_count
+    for feat in momentum_features:
+        new_col = f"{feat}_cb"
+        panel_df[new_col] = (panel_df[feat] ** 3).astype('float32')
+        interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} momentum cubed features")
+    
+    # 4.3 Volatility Squared (variance, vol-of-vol proxy)
+    print("  [4.3] Volatility squared (variance)...")
+    start_count = interaction_count
+    for feat in volatility_features:
+        new_col = f"{feat}_sq"
+        panel_df[new_col] = (panel_df[feat] ** 2).astype('float32')
+        interaction_count += 1
+    print(f"      Generated {interaction_count - start_count} volatility squared features")
+    
+    # =========================================================================
+    # Type 5: REGIME-CONDITIONAL FEATURES
+    # =========================================================================
+    if regime_flags:
+        print("\n[interaction] Type 5: Regime-conditional (feature × regime_flag)...")
+        
+        # 5.1 Momentum × Regime Flags
+        print("  [5.1] Momentum × Regime Flags...")
+        start_count = interaction_count
+        for feat1 in momentum_features:
+            for feat2 in regime_flags:
+                new_col = f"{feat1}_in_{feat2}"
+                panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Mom×Regime interactions")
+        
+        # 5.2 Volatility × Regime Flags
+        print("  [5.2] Volatility × Regime Flags...")
+        start_count = interaction_count
+        for feat1 in volatility_features:
+            for feat2 in regime_flags:
+                new_col = f"{feat1}_in_{feat2}"
+                panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Vol×Regime interactions")
+    
+    # =========================================================================
+    # VALIDATION
+    # =========================================================================
+    print("\n[interaction] Validation checks...")
+    
+    # Check for Inf values
+    inf_cols = []
+    for col in panel_df.columns:
+        if col not in exclude_cols:
+            if np.isinf(panel_df[col]).any():
+                inf_cols.append(col)
+    
+    if inf_cols:
+        print(f"  [WARNING] Found {len(inf_cols)} features with Inf values:")
+        for col in inf_cols[:5]:  # Show first 5
+            print(f"    - {col}")
+        if len(inf_cols) > 5:
+            print(f"    ... and {len(inf_cols) - 5} more")
+        print("  [fix] Replacing Inf with NaN...")
+        panel_df = panel_df.replace([np.inf, -np.inf], np.nan)
+    
+    # Check NaN percentage
+    high_nan_cols = []
+    for col in panel_df.columns:
+        if col not in exclude_cols:
+            nan_pct = panel_df[col].isna().sum() / len(panel_df) * 100
+            if nan_pct > 50:
+                high_nan_cols.append((col, nan_pct))
+    
+    if high_nan_cols:
+        print(f"  [WARNING] Found {len(high_nan_cols)} features with > 50% NaN:")
+        for col, pct in sorted(high_nan_cols, key=lambda x: x[1], reverse=True)[:5]:
+            print(f"    - {col}: {pct:.1f}% NaN")
+        if len(high_nan_cols) > 5:
+            print(f"    ... and {len(high_nan_cols) - 5} more")
+    
+    # Final summary
+    final_feature_count = len(panel_df.columns)
+    print(f"\n[interaction] ✓ Interaction generation complete!")
+    print(f"[interaction] Total interactions generated: {interaction_count}")
+    print(f"[interaction] Final feature count: {final_feature_count}")
+    print(f"[interaction] Memory usage: {panel_df.memory_usage(deep=True).sum() / 1024 / 1024:.1f} MB")
+    
+    return panel_df
+
+# ============================================================================
 # MAIN PIPELINE
 # ============================================================================
 
@@ -976,9 +1279,18 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     print(f"[time] Macro features added in {macro_feat_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
+    # 7.7. PHASE 1: Generate exhaustive interaction features
+    # -------------------------------------------------------------------------
+    print("\n[7.7/9] PHASE 1: Generating exhaustive interaction features...")
+    interaction_start = time.time()
+    panel_df = generate_interaction_features(panel_df, config)
+    interaction_elapsed = time.time() - interaction_start
+    print(f"[time] Interaction features added in {interaction_elapsed:.2f} seconds")
+    
+    # -------------------------------------------------------------------------
     # 8. Add ADV rank for filtering
     # -------------------------------------------------------------------------
-    print("\n[8/8] Adding ADV cross-sectional rank...")
+    print("\n[8/9] Adding ADV cross-sectional rank...")
     adv_col = f'ADV_{config.universe.adv_window}'
     panel_df = add_adv_rank(panel_df, adv_col)
     
@@ -986,9 +1298,9 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     panel_df = panel_df.set_index(['Date', 'Ticker']).sort_index()
     
     # -------------------------------------------------------------------------
-    # 7. Save outputs
+    # 9. Save outputs
     # -------------------------------------------------------------------------
-    print("\n[save] Saving outputs...")
+    print("\n[9/9] Saving outputs...")
     
     # Ensure output directory exists
     os.makedirs(os.path.dirname(config.paths.panel_parquet), exist_ok=True)
