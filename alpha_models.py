@@ -27,6 +27,8 @@ import numpy as np
 from typing import List, Dict, Optional, Tuple
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.model_selection import KFold
+from sklearn.feature_selection import mutual_info_regression
+from sklearn.linear_model import ElasticNetCV
 from scipy.stats import spearmanr
 import warnings
 
@@ -557,6 +559,235 @@ def compute_cv_ic_with_folds(
     }
 
 
+def compute_cv_mi(
+    feature: pd.Series,
+    target: pd.Series,
+    config,
+    n_splits: int = 5
+) -> Dict:
+    """
+    Compute mutual information across cross-validation folds.
+    
+    Returns:
+    --------
+    dict with keys:
+        - 'mean_mi': Average MI across folds
+        - 'fold_mis': List of MI values from each fold
+        - 'mi_positivity_rate': Fraction of folds with MI > 0
+    """
+    feature_values = feature.values.reshape(-1, 1)
+    target_values = target.values
+    
+    # Remove NaN rows
+    valid_mask = ~(np.isnan(feature_values).any(axis=1) | np.isnan(target_values))
+    feature_clean = feature_values[valid_mask]
+    target_clean = target_values[valid_mask]
+    
+    if len(feature_clean) < 50:
+        return {
+            'mean_mi': 0.0,
+            'fold_mis': [],
+            'mi_positivity_rate': 0.0
+        }
+    
+    # K-Fold CV
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    fold_mis = []
+    
+    for train_idx, test_idx in kf.split(feature_clean):
+        X_test = feature_clean[test_idx]
+        y_test = target_clean[test_idx]
+        
+        if len(X_test) < 20:
+            continue
+        
+        # Compute MI on test fold
+        mi = mutual_info_regression(
+            X_test, y_test, 
+            discrete_features=False,
+            random_state=42,
+            n_neighbors=min(3, len(X_test) // 2)
+        )[0]
+        
+        fold_mis.append(mi)
+    
+    if len(fold_mis) == 0:
+        return {
+            'mean_mi': 0.0,
+            'fold_mis': [],
+            'mi_positivity_rate': 0.0
+        }
+    
+    # Calculate positivity rate
+    positive_count = sum(mi > 0 for mi in fold_mis)
+    mi_positivity_rate = positive_count / len(fold_mis)
+    
+    return {
+        'mean_mi': np.mean(fold_mis),
+        'fold_mis': fold_mis,
+        'mi_positivity_rate': mi_positivity_rate
+    }
+
+
+def filter_multicollinear_features(
+    train_data: pd.DataFrame,
+    candidate_features: List[str],
+    mi_values: Dict[str, float],
+    corr_threshold: float = 0.75
+) -> List[str]:
+    """
+    Remove redundant features using pairwise Spearman correlation.
+    
+    Among correlated feature groups (correlation > threshold),
+    keep the feature with highest MI.
+    
+    Parameters:
+    -----------
+    train_data : pd.DataFrame
+        Training data
+    candidate_features : List[str]
+        Features to filter
+    mi_values : Dict[str, float]
+        MI value for each feature
+    corr_threshold : float
+        Correlation threshold (default 0.75)
+        
+    Returns:
+    --------
+    List[str]
+        Filtered feature list with multicollinearity removed
+    """
+    if len(candidate_features) <= 1:
+        return candidate_features
+    
+    # Build correlation matrix
+    feature_matrix = train_data[candidate_features].dropna()
+    
+    if len(feature_matrix) < 50:
+        return candidate_features
+    
+    corr_matrix = feature_matrix.corr(method='spearman').abs()
+    
+    # Identify correlated groups
+    to_drop = set()
+    
+    for i, feat_i in enumerate(candidate_features):
+        if feat_i in to_drop:
+            continue
+        
+        for j in range(i + 1, len(candidate_features)):
+            feat_j = candidate_features[j]
+            
+            if feat_j in to_drop:
+                continue
+            
+            # Check correlation
+            corr_val = corr_matrix.loc[feat_i, feat_j]
+            
+            if corr_val > corr_threshold:
+                # Drop the one with lower MI
+                mi_i = mi_values.get(feat_i, 0.0)
+                mi_j = mi_values.get(feat_j, 0.0)
+                
+                if mi_j > mi_i:
+                    to_drop.add(feat_i)
+                    break  # feat_i is dropped, no need to check more
+                else:
+                    to_drop.add(feat_j)
+    
+    # Also drop features with MI = 0
+    for feat in candidate_features:
+        if mi_values.get(feat, 0.0) <= 0:
+            to_drop.add(feat)
+    
+    filtered = [f for f in candidate_features if f not in to_drop]
+    
+    print(f"[filter_multicol] Dropped {len(to_drop)} features due to multicollinearity or zero MI")
+    
+    return filtered
+
+
+def elastic_net_feature_selection(
+    train_data: pd.DataFrame,
+    candidate_features: List[str],
+    target_col: str,
+    cv_folds: int = 5,
+    l1_ratio_values: List[float] = None,
+    max_features: int = 15
+) -> Tuple[List[str], Dict[str, float]]:
+    """
+    Select features using Elastic Net with cross-validated regularization.
+    
+    Parameters:
+    -----------
+    train_data : pd.DataFrame
+        Training data
+    candidate_features : List[str]
+        Features to consider
+    target_col : str
+        Target column name
+    cv_folds : int
+        Number of CV folds (default 5)
+    l1_ratio_values : List[float]
+        L1 ratios to test (default [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0])
+    max_features : int
+        Maximum features to return (default 15)
+        
+    Returns:
+    --------
+    Tuple[List[str], Dict[str, float]]
+        - Selected feature names
+        - Feature coefficients (non-zero)
+    """
+    if l1_ratio_values is None:
+        l1_ratio_values = [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]
+    
+    # Prepare data
+    X = train_data[candidate_features].copy()
+    y = train_data[target_col].copy()
+    
+    # Drop rows with NaN
+    valid_mask = ~(X.isna().any(axis=1) | y.isna())
+    X = X[valid_mask]
+    y = y[valid_mask]
+    
+    if len(X) < 100:
+        print(f"[elastic_net] Insufficient data ({len(X)} rows), skipping")
+        return candidate_features[:max_features], {}
+    
+    # Standardize features (important for regularization)
+    X_mean = X.mean()
+    X_std = X.std()
+    X_std[X_std == 0] = 1.0  # Avoid division by zero
+    X_scaled = (X - X_mean) / X_std
+    
+    # Fit Elastic Net with CV
+    print(f"[elastic_net] Fitting ElasticNetCV on {len(candidate_features)} features...")
+    
+    enet = ElasticNetCV(
+        l1_ratio=l1_ratio_values,
+        cv=cv_folds,
+        max_iter=10000,
+        random_state=42,
+        n_jobs=-1
+    )
+    
+    enet.fit(X_scaled, y)
+    
+    # Extract non-zero coefficients
+    coefficients = pd.Series(enet.coef_, index=candidate_features)
+    non_zero_features = coefficients[coefficients != 0].abs().sort_values(ascending=False)
+    
+    print(f"[elastic_net] Optimal l1_ratio: {enet.l1_ratio_:.3f}, alpha: {enet.alpha_:.6f}")
+    print(f"[elastic_net] Selected {len(non_zero_features)} features with non-zero coefficients")
+    
+    # Limit to max_features
+    selected_features = non_zero_features.head(max_features).index.tolist()
+    feature_coefs = non_zero_features.head(max_features).to_dict()
+    
+    return selected_features, feature_coefs
+
+
 def train_alpha_model(
     panel: pd.DataFrame,
     universe_metadata: pd.DataFrame,
@@ -733,12 +964,19 @@ def train_alpha_model(
     
     print(f"[train] Evaluating {len(candidate_features)} candidate features ({len(base_features)} raw + {len(binning_dict)} binned)")
     
-    # PHASE 0: Compute CV-IC with fold-level details for sign consistency filtering
+    # ===== PHASE 2: ENHANCED FEATURE SELECTION PIPELINE =====
+    # Stage 0: Univariate filters (IC + MI) + correlation pruning
+    # Stage 1: Multivariate selection (Elastic Net) if needed
+    
+    print(f"[train] ===== PHASE 2 FEATURE SELECTION PIPELINE =====")
+    
     from joblib import Parallel, delayed
     
-    def compute_single_cv_ic_detailed(feat, train_data, target_col, config):
-        """Helper function for parallel CV-IC computation with fold details."""
+    def compute_single_feature_stats(feat, train_data, target_col, config):
+        """Compute IC and MI statistics for a single feature."""
         is_binned = feat.endswith('_Bin')
+        
+        # Compute IC with fold details
         cv_ic_result = compute_cv_ic_with_folds(
             train_data[feat],
             train_data[target_col],
@@ -746,57 +984,168 @@ def train_alpha_model(
             n_splits=5,
             is_already_binned=is_binned
         )
-        return feat, cv_ic_result
+        
+        # Compute MI with fold details
+        cv_mi_result = compute_cv_mi(
+            train_data[feat],
+            train_data[target_col],
+            config,
+            n_splits=5
+        )
+        
+        # Compute IC t-statistic for significance
+        fold_ics = cv_ic_result['fold_ics']
+        if len(fold_ics) > 1:
+            ic_mean = np.mean(fold_ics)
+            ic_std = np.std(fold_ics, ddof=1)
+            ic_tstat = abs(ic_mean) / (ic_std / np.sqrt(len(fold_ics))) if ic_std > 0 else 0
+        else:
+            ic_tstat = 0
+        
+        return feat, {
+            'ic': cv_ic_result,
+            'mi': cv_mi_result,
+            'ic_tstat': ic_tstat
+        }
     
     # Parallel execution across features
     n_jobs = config.compute.n_jobs if hasattr(config.compute, 'n_jobs') else -1
-    cv_ic_results = Parallel(n_jobs=n_jobs, backend='threading')(
-        delayed(compute_single_cv_ic_detailed)(feat, train_data, target_col, config)
+    feature_stats = Parallel(n_jobs=n_jobs, backend='threading')(
+        delayed(compute_single_feature_stats)(feat, train_data, target_col, config)
         for feat in candidate_features
     )
     
-    # Extract mean ICs and sign consistency
-    cv_ic_values = {feat: result['mean_ic'] for feat, result in cv_ic_results}
-    sign_consistency_values = {feat: result['sign_consistency'] for feat, result in cv_ic_results}
+    # Extract statistics into structured dictionaries
+    cv_ic_values = {feat: stats['ic']['mean_ic'] for feat, stats in feature_stats}
+    sign_consistency_values = {feat: stats['ic']['sign_consistency'] for feat, stats in feature_stats}
+    ic_tstat_values = {feat: stats['ic_tstat'] for feat, stats in feature_stats}
+    cv_mi_values = {feat: stats['mi']['mean_mi'] for feat, stats in feature_stats}
+    mi_positivity_values = {feat: stats['mi']['mi_positivity_rate'] for feat, stats in feature_stats}
     
     cv_ic_series = pd.Series(cv_ic_values).dropna()
     sign_consistency_series = pd.Series(sign_consistency_values)
+    ic_tstat_series = pd.Series(ic_tstat_values)
+    cv_mi_series = pd.Series(cv_mi_values).dropna()
+    mi_positivity_series = pd.Series(mi_positivity_values)
     
-    # PHASE 0 FILTER: Require 80%+ sign consistency to prevent signal reversal
+    print(f"[train] Computed IC and MI statistics for {len(candidate_features)} features")
+    
+    # ===== STAGE 0: UNIVARIATE FILTERS =====
+    
+    # Step 1: IC Filter (magnitude + t-stat + sign consistency)
+    ic_threshold = config.features.ic_threshold  # 0.02
     min_sign_consistency = 0.80
+    min_ic_tstat = 1.96  # 95% confidence
+    
+    abs_cv_ic = cv_ic_series.abs()
+    ic_magnitude_mask = abs_cv_ic >= ic_threshold
+    ic_tstat_mask = ic_tstat_series >= min_ic_tstat
     sign_stable_mask = sign_consistency_series >= min_sign_consistency
     
-    n_unstable = (~sign_stable_mask).sum()
-    if n_unstable > 0:
-        print(f"[train] PHASE 0: Filtered out {n_unstable} features with sign consistency < {min_sign_consistency:.0%}")
+    ic_filter_mask = ic_magnitude_mask & ic_tstat_mask & sign_stable_mask
     
-    # Apply both filters: IC threshold AND sign consistency
-    abs_cv_ic = cv_ic_series.abs()
-    ic_threshold_mask = abs_cv_ic >= config.features.ic_threshold
-    combined_mask = ic_threshold_mask & sign_stable_mask
+    features_after_ic = cv_ic_series[ic_filter_mask].index.tolist()
     
-    # Select top features that pass both filters
-    selected_features = abs_cv_ic[combined_mask].nlargest(config.features.max_features).index.tolist()
+    print(f"[train] Step 1 (IC Filter): {len(features_after_ic)}/{len(candidate_features)} passed")
+    print(f"  - |IC| >= {ic_threshold}: {ic_magnitude_mask.sum()} features")
+    print(f"  - IC t-stat >= {min_ic_tstat}: {ic_tstat_mask.sum()} features")
+    print(f"  - Sign consistency >= {min_sign_consistency:.0%}: {sign_stable_mask.sum()} features")
     
-    if len(selected_features) == 0:
-        warnings.warn("No features passed CV-IC threshold, using momentum rank")
+    if len(features_after_ic) == 0:
+        warnings.warn("No features passed IC filter, using momentum rank")
         baseline_feature = 'Close%-63'
         return (MomentumRankModel(feature=baseline_feature), 
                 [baseline_feature], 
                 pd.Series({baseline_feature: np.nan}))
     
-    print(f"[train] Selected {len(selected_features)} features by CV-IC")
-    print(f"[train] Top 5 by |CV-IC|: {abs_cv_ic[selected_features].nlargest(5).to_dict()}")
+    # Step 2: MI Filter (80% positivity + mean MI > 0)
+    min_mi_positivity = 0.80
+    
+    mi_positivity_mask = mi_positivity_series >= min_mi_positivity
+    mean_mi_positive_mask = cv_mi_series > 0
+    
+    mi_filter_mask = mi_positivity_mask & mean_mi_positive_mask
+    mi_filter_mask = mi_filter_mask.reindex(features_after_ic, fill_value=False)
+    
+    features_after_mi = [f for f in features_after_ic if mi_filter_mask.get(f, False)]
+    
+    print(f"[train] Step 2 (MI Filter): {len(features_after_mi)}/{len(features_after_ic)} passed")
+    print(f"  - MI > 0 in >= {min_mi_positivity:.0%} folds: {mi_positivity_mask.sum()} features")
+    print(f"  - Mean MI > 0: {mean_mi_positive_mask.sum()} features")
+    
+    if len(features_after_mi) == 0:
+        warnings.warn("No features passed MI filter, using momentum rank")
+        baseline_feature = 'Close%-63'
+        return (MomentumRankModel(feature=baseline_feature), 
+                [baseline_feature], 
+                pd.Series({baseline_feature: np.nan}))
+    
+    # Step 3: Multicollinearity Filter (correlation threshold 0.75)
+    mi_values_dict = cv_mi_series[features_after_mi].to_dict()
+    
+    features_after_multicol = filter_multicollinear_features(
+        train_data=train_data,
+        candidate_features=features_after_mi,
+        mi_values=mi_values_dict,
+        corr_threshold=0.75
+    )
+    
+    print(f"[train] Step 3 (Multicollinearity): {len(features_after_multicol)}/{len(features_after_mi)} passed")
+    
+    if len(features_after_multicol) == 0:
+        warnings.warn("No features passed multicollinearity filter, using momentum rank")
+        baseline_feature = 'Close%-63'
+        return (MomentumRankModel(feature=baseline_feature), 
+                [baseline_feature], 
+                pd.Series({baseline_feature: np.nan}))
+    
+    # ===== STAGE 1: MULTIVARIATE SELECTION (if needed) =====
+    
+    if len(features_after_multicol) > 15:
+        print(f"[train] Stage 1: {len(features_after_multicol)} features exceed threshold, running Elastic Net...")
+        
+        selected_features, enet_coefs = elastic_net_feature_selection(
+            train_data=train_data,
+            candidate_features=features_after_multicol,
+            target_col=target_col,
+            cv_folds=5,
+            max_features=15
+        )
+        
+        print(f"[train] Elastic Net selected {len(selected_features)} features")
+        
+        if len(selected_features) == 0:
+            # Fall back to top 15 by IC × MI
+            print(f"[train] Elastic Net returned 0 features, falling back to IC × MI ranking")
+            composite_scores = abs_cv_ic[features_after_multicol] * cv_mi_series[features_after_multicol]
+            selected_features = composite_scores.nlargest(15).index.tolist()
+    else:
+        # Use all features from Stage 0
+        selected_features = features_after_multicol
+        print(f"[train] Stage 1: {len(selected_features)} features <= 15, using all from univariate filters")
+    
+    if len(selected_features) == 0:
+        warnings.warn("No features selected after Phase 2 pipeline, using momentum rank")
+        baseline_feature = 'Close%-63'
+        return (MomentumRankModel(feature=baseline_feature), 
+                [baseline_feature], 
+                pd.Series({baseline_feature: np.nan}))
+    
+    print(f"[train] ===== PHASE 2 SUMMARY =====")
+    print(f"[train] Final selection: {len(selected_features)} features")
+    print(f"[train] Top 5 by |IC|: {abs_cv_ic[selected_features].nlargest(5).to_dict()}")
+    print(f"[train] Top 5 by MI: {cv_mi_series[selected_features].nlargest(5).to_dict()}")
     
     # DEBUG: Show how many raw vs binned features were selected
     raw_selected = [f for f in selected_features if not f.endswith('_Bin')]
     binned_selected = [f for f in selected_features if f.endswith('_Bin')]
-    print(f"[train] Breakdown: {len(raw_selected)} raw + {len(binned_selected)} binned features selected")
+    print(f"[train] Breakdown: {len(raw_selected)} raw + {len(binned_selected)} binned features")
     
-    # DEBUG: Show IC range
-    if len(selected_features) > 0:
-        ic_values = cv_ic_series[selected_features]
-        print(f"[train] IC range: [{ic_values.min():.4f}, {ic_values.max():.4f}]")
+    # DEBUG: Show IC and MI ranges
+    ic_values = cv_ic_series[selected_features]
+    mi_values = cv_mi_series[selected_features]
+    print(f"[train] IC range: [{ic_values.min():.4f}, {ic_values.max():.4f}]")
+    print(f"[train] MI range: [{mi_values.min():.4f}, {mi_values.max():.4f}]")
     
     # Selected features already include raw and/or binned versions based on their IC
     # No need to swap - use selected features directly
