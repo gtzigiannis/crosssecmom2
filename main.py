@@ -223,6 +223,44 @@ def step_4_analyze(config: ResearchConfig, results_df: pd.DataFrame = None):
     for key, value in stats.items():
         print(f"{key:20s}: {value}")
     
+    # Print attribution analysis if available
+    if hasattr(results_df, 'attrs') and 'attribution' in results_df.attrs:
+        print("\n" + "="*80)
+        print("ATTRIBUTION SUMMARY")
+        print("="*80)
+        
+        attribution = results_df.attrs['attribution']
+        
+        # Feature attribution summary
+        if 'feature_attribution' in attribution and len(attribution['feature_attribution']) > 0:
+            print("\nTop 5 Features by Importance:")
+            for i, row in attribution['feature_attribution'].head(5).iterrows():
+                print(f"  {i+1}. {row['feature']:30s} - Score: {row['importance_score']:.4f}, "
+                      f"Freq: {row['selection_freq']*100:.1f}%, IC: {row['avg_ic']:+.4f}")
+        
+        # Long/short attribution summary
+        if 'long_short_attribution' in attribution:
+            ls_attr = attribution['long_short_attribution']
+            print(f"\nLong/Short Attribution:")
+            print(f"  Long:  {ls_attr['long_total_return']*100:+.2f}% "
+                  f"({ls_attr['long_contribution_pct']:.1f}% of total), "
+                  f"Win Rate: {ls_attr['long_win_rate']:.1f}%")
+            print(f"  Short: {ls_attr['short_total_return']*100:+.2f}% "
+                  f"({ls_attr['short_contribution_pct']:.1f}% of total), "
+                  f"Win Rate: {ls_attr['short_win_rate']:.1f}%")
+        
+        # IC decay summary
+        if 'ic_decay' in attribution and len(attribution['ic_decay']) > 0:
+            ic_decay = attribution['ic_decay']
+            if 'ic_trend' in ic_decay.attrs:
+                trend = ic_decay.attrs['ic_trend']
+                print(f"\nIC Decay Analysis:")
+                print(f"  Trend: {trend['interpretation']} (slope: {trend['slope']:+.6f}, p-value: {trend['p_value']:.4f})")
+        
+        print("\n" + "="*80)
+        print(f"Full attribution results saved to: {config.paths.data_dir}/attribution_*.csv")
+        print("="*80)
+    
     step_elapsed = time.time() - step_start
     print(f"\n[time] Analysis completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")
     

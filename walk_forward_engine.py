@@ -29,6 +29,7 @@ from config import ResearchConfig
 from alpha_models import train_alpha_model, AlphaModel
 from portfolio_construction import construct_portfolio, evaluate_portfolio_return
 from regime import compute_regime_series, get_portfolio_mode_for_regime
+from attribution_analysis import compute_attribution_analysis, save_attribution_results
 
 
 def apply_universe_filters(
@@ -1015,6 +1016,33 @@ def run_walk_forward_backtest(
     # Store diagnostics in results_df as metadata
     if len(diagnostics) > 0:
         results_df.attrs['diagnostics'] = diagnostics
+    
+    # Compute attribution analysis
+    if verbose and len(results_df) > 0 and len(diagnostics) > 0:
+        try:
+            attribution_results = compute_attribution_analysis(
+                results_df=results_df,
+                diagnostics=diagnostics,
+                panel_df=panel_df,
+                universe_metadata=universe_metadata,
+                config=config
+            )
+            
+            # Store attribution in results metadata
+            results_df.attrs['attribution'] = attribution_results
+            
+            # Save attribution to CSV files
+            if config.compute.save_intermediate:
+                output_dir = Path(config.paths.data_dir)
+                save_attribution_results(
+                    attribution_results,
+                    output_dir=str(output_dir),
+                    prefix="attribution"
+                )
+        except Exception as e:
+            print(f"\n[warn] Attribution analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
     
     return results_df
 
