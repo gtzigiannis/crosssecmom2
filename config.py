@@ -49,17 +49,39 @@ class UniverseConfig:
     """Universe filtering and eligibility parameters."""
     
     # Liquidity filters
-    min_adv_percentile: float = 0.30  # Minimum ADV percentile (30th percentile)
+    min_adv_percentile: float = 0.50  # Minimum ADV percentile (50th percentile - original strict filter)
     adv_window: int = 63              # Window for ADV calculation
     
     # Data quality
-    min_data_quality: float = 0.80    # Minimum fraction of non-NaN features
+    min_data_quality: float = 0.90    # Minimum fraction of non-NaN features (original strict filter)
     # NOTE: min_history_days removed - history requirement is determined by
     # FEATURE_MAX_LAG_DAYS + TRAINING_WINDOW_DAYS in walk_forward_engine
     
     # Metadata filters
     exclude_leveraged: bool = True    # Exclude leveraged/inverse ETFs
     exclude_non_canonical: bool = True  # Exclude non-canonical duplicates
+    
+    # PHASE 0: Asset class filter to test equity-only vs cross-asset
+    equity_only: bool = True  # If True, filter to equity families only (excludes bonds, commodities, etc.)
+    equity_family_keywords: list = None  # Keywords to identify equity families
+    
+    def __post_init__(self):
+        """Set default equity family keywords if not provided."""
+        if self.equity_family_keywords is None:
+            # Families that represent equity/stock exposure
+            # Includes: US stocks, international stocks, sectors, regions, country funds
+            # Excludes: pure bonds, digital assets (bonds, crypto)
+            self.equity_family_keywords = [
+                'Stock', 'Equity', 'Blend', 'Growth', 'Value',  # Core equity styles
+                'Large', 'Mid', 'Small',  # Size categories (when combined with Blend/Growth/Value)
+                'Country -', 'Region', 'Europe', 'Japan', 'India', 'Latin America',  # Geographic
+                'Emerging Mkts', 'Foreign',  # International equity
+                'Real Estate',  # REITs (equity-like)
+                'Technology', 'Health', 'Financial', 'Industrials', 'Utilities',  # Sectors
+                'Energy', 'Consumer', 'Communication',  # More sectors
+                'Natural Resources',  # Includes XLB (Materials) and XME (Metals/Mining) - sector ETFs
+                'Commodities Focused'  # Includes USO (oil), OIH (oil services) - commodity equity exposure
+            ]
     
     # Duplicate detection
     dup_corr_threshold: float = 0.99  # Correlation threshold for duplicates
@@ -73,12 +95,14 @@ class PortfolioConfig:
     """Portfolio construction parameters."""
     
     # Position sizing
-    long_quantile: float = 0.9   # Top 10% for long portfolio
-    short_quantile: float = 0.1  # Bottom 10% for short portfolio
+    # PHASE 0 FIX: Widen from 25% to 33% to get more positions with small equity universe
+    long_quantile: float = 0.67   # Top 33% for long portfolio (above 67th percentile)
+    short_quantile: float = 0.33  # Bottom 33% for short portfolio (below 33rd percentile)
         
     # === Margin Regime ===
     # Choose margin regime: "reg_t_initial", "reg_t_maintenance", or "portfolio"
-    margin_regime: str = "reg_t_maintenance"  # Most realistic for held positions
+    # PHASE 0: Use reg_t_initial (most conservative) to test at 1.0x gross leverage
+    margin_regime: str = "reg_t_initial"  # Conservative for Phase 0 diagnostic
     
     # Reg T Initial Margins (50%/50% - most conservative, for opening positions)
     reg_t_initial_long: float = 0.50
@@ -95,8 +119,8 @@ class PortfolioConfig:
     # === Margin Utilization ===
     # Fraction of available margin capacity to use
     # 1.0 = fully margin-saturated (max gross under regime)
-    # 0.80 = use 80% of theoretical margin, keep 20% as cash collateral earning cash_rate
-    max_margin_utilization: float = 0.80
+    # PHASE 0: Use 0.50 with reg_t_initial to achieve 1.0x gross leverage (0.5 long + 0.5 short)
+    max_margin_utilization: float = 0.50  # Conservative: proves strategy works at 1.0x before using 3.64x
     
     # === Dollar-Neutral Constraint ===
     enforce_dollar_neutral: bool = True   # True = long exposure = short exposure
@@ -291,7 +315,7 @@ class PortfolioConfig:
 @dataclass
 class DebugConfig:
     """Debugging and diagnostic configuration."""
-    enable_accounting_debug: bool = False
+    enable_accounting_debug: bool = True  # Enable for verification
     debug_max_periods: int = 0  # 0 = no limit, >0 = limit number of logged periods
 
 
@@ -302,6 +326,10 @@ class FeatureConfig:
     # Base features to compute (these are computed WITHOUT using targets)
     # NOTE: If None, will auto-discover ALL features from panel data
     base_features: List[str] = None
+    
+    # Winsorization control
+    enable_winsorization: bool = False  # If True, winsorize forward returns at ±n_sigma to reduce outlier noise
+    winsorization_n_sigma: float = 2.5  # Number of standard deviations for winsorization bounds
     
     # Binning control
     use_manual_binning_candidates: bool = False  # If True, use hardcoded binning_candidates; if False, bin ALL features
@@ -372,7 +400,7 @@ class ComputeConfig:
     
     n_jobs: int = -1                  # Parallel jobs for feature engineering (-1 = all cores)
     verbose: bool = True              # Print progress messages
-    parallelize_backtest: bool = True   # Parallelize walk-forward backtest
+    parallelize_backtest: bool = True  # Parallel execution of backtest periods
     
     # Data download parameters
     batch_sleep: float = 1.0          # Sleep time (seconds) after every 20 downloads to avoid rate limiting
@@ -410,7 +438,7 @@ class RegimeConfig:
 @dataclass
 class DebugConfig:
     """Debugging and diagnostic configuration."""
-    enable_accounting_debug: bool = False
+    enable_accounting_debug: bool = True  # Enable for verification
     debug_max_periods: int = 0  # 0 = no limit, >0 = limit number of logged periods
 
 

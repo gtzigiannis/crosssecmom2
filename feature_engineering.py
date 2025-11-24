@@ -372,7 +372,7 @@ def process_ticker(ticker: str, data: pd.DataFrame, adv_window: int = 63) -> pd.
 # FORWARD RETURNS (TARGET VARIABLES)
 # ============================================================================
 
-def add_forward_returns(panel_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+def add_forward_returns(panel_df: pd.DataFrame, horizon: int, config: 'ResearchConfig') -> pd.DataFrame:
     """
     Add forward returns at specified horizon.
     
@@ -384,6 +384,8 @@ def add_forward_returns(panel_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
         Panel with (Date, Ticker) index or columns
     horizon : int
         Forward horizon in days
+    config : ResearchConfig
+        Configuration object with feature settings
         
     Returns
     -------
@@ -394,11 +396,46 @@ def add_forward_returns(panel_df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     
     # Compute forward returns per ticker (as decimals, not percent)
     # CRITICAL: +5% return is stored as 0.05, not 5.0
-    panel_df[f'FwdRet_{horizon}'] = (
+    fwd_ret = (
         panel_df.groupby('Ticker')['Close']
         .pct_change(horizon)
         .shift(-horizon)
-    ).astype('float32')
+    )
+    
+    # PHASE 0 CONTROL: Optional winsorization of outliers at ±n_sigma
+    # Controlled by config.features.enable_winsorization
+    if config.features.enable_winsorization:
+        print(f"[fwd] Winsorizing forward returns at ±{config.features.winsorization_n_sigma}σ (per period)")
+        
+        # Group by date to winsorize within each cross-section
+        def winsorize_cross_section(group, n_sigma=config.features.winsorization_n_sigma):
+            """Winsorize returns within a single time period."""
+            valid = group.dropna()
+            if len(valid) == 0:
+                return group
+            
+            mean = valid.mean()
+            std = valid.std()
+            
+            if std > 0:
+                lower_bound = mean - n_sigma * std
+                upper_bound = mean + n_sigma * std
+                return group.clip(lower=lower_bound, upper=upper_bound)
+            else:
+                return group
+        
+        # Group by Date column and winsorize, preserving original index
+        fwd_ret_winsorized = fwd_ret.groupby(panel_df['Date'], group_keys=False).apply(winsorize_cross_section)
+        
+        # Log winsorization impact
+        n_clipped = ((fwd_ret != fwd_ret_winsorized) & fwd_ret.notna()).sum()
+        pct_clipped = 100 * n_clipped / fwd_ret.notna().sum()
+        print(f"[fwd] Winsorized {n_clipped:,} observations ({pct_clipped:.2f}% of valid data)")
+        
+        panel_df[f'FwdRet_{horizon}'] = fwd_ret_winsorized.astype('float32')
+    else:
+        print(f"[fwd] Winsorization disabled - using raw forward returns")
+        panel_df[f'FwdRet_{horizon}'] = fwd_ret.astype('float32')
     
     return panel_df
 
@@ -904,7 +941,7 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     print("\n[5/8] Computing forward returns...")
     fwd_ret_start = time.time()
     panel_df = panel_df.reset_index()
-    panel_df = add_forward_returns(panel_df, config.time.HOLDING_PERIOD_DAYS)
+    panel_df = add_forward_returns(panel_df, config.time.HOLDING_PERIOD_DAYS, config)
     fwd_ret_elapsed = time.time() - fwd_ret_start
     print(f"[time] Forward returns computed in {fwd_ret_elapsed:.2f} seconds")
     

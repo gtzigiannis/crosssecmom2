@@ -10,15 +10,26 @@ Usage:
     python main.py --all
 """
 
+# MUST be set BEFORE importing numpy/pandas to avoid Windows Intel MKL threading crashes
+import os
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
 import argparse
 import pandas as pd
 from pathlib import Path
 import time
+from datetime import datetime
 
 from config import get_default_config, ResearchConfig
 from universe_metadata import build_universe_metadata, validate_universe_metadata
 from feature_engineering import run_feature_engineering
-from walk_forward_engine import run_walk_forward_backtest, analyze_performance
+from walk_forward_engine import (
+    run_walk_forward_backtest, 
+    analyze_performance
+)
 
 
 def step_1_feature_engineering(config: ResearchConfig):
@@ -170,9 +181,17 @@ def step_3_backtest(
         verbose=True
     )
     
-    # Save results
+    # Save results with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = Path(config.paths.results_csv).parent
+    results_filename = f"cs_momentum_results_{timestamp}.csv"
+    results_path = results_dir / results_filename
+    results_df.to_csv(results_path)
+    print(f"\n[save] Results saved to: {results_path}")
+    
+    # Also save as latest for convenience
     results_df.to_csv(config.paths.results_csv)
-    print(f"\n[save] Results saved to: {config.paths.results_csv}")
+    print(f"[save] Latest results also saved to: {config.paths.results_csv}")
     
     step_elapsed = time.time() - step_start
     print(f"[time] Backtest completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")

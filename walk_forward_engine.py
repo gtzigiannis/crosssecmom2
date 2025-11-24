@@ -22,6 +22,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
+from pathlib import Path
 import warnings
 
 from config import ResearchConfig
@@ -69,6 +70,35 @@ def apply_universe_filters(
     if 'in_core_after_duplicates' in metadata_idx.columns:
         core_tickers = metadata_idx[metadata_idx['in_core_after_duplicates'] == True].index
         tickers = tickers.intersection(core_tickers)
+    
+    # PHASE 0: Equity-only filter (test if cross-asset momentum adds value)
+    if config.universe.equity_only and 'family' in metadata_idx.columns:
+        # Filter to equity families using keyword matching
+        equity_keywords = config.universe.equity_family_keywords
+        if equity_keywords is None:
+            # Fallback if __post_init__ didn't run (shouldn't happen with dataclass)
+            equity_keywords = ['Stock', 'Equity', 'Blend', 'Growth', 'Value', 'Real Estate']
+        
+        def is_equity_family(family_name):
+            """Check if family name contains any equity keyword."""
+            if pd.isna(family_name):
+                return False
+            family_str = str(family_name)
+            return any(keyword.lower() in family_str.lower() for keyword in equity_keywords)
+        
+        equity_mask = metadata_idx['family'].apply(is_equity_family)
+        equity_tickers = metadata_idx[equity_mask].index
+        
+        n_before = len(tickers)
+        tickers = tickers.intersection(equity_tickers)
+        n_after = len(tickers)
+        
+        if n_before > n_after:
+            # Only print once per run (first time filter is applied)
+            import sys
+            if not hasattr(sys, '_equity_filter_printed'):
+                print(f"[universe] PHASE 0: Equity-only filter enabled, reduced universe {n_before} → {n_after} tickers")
+                sys._equity_filter_printed = True
     
     # 2. ADV liquidity filter
     if 'ADV_63_Rank' in cross_section.columns:
@@ -500,24 +530,90 @@ def run_walk_forward_backtest(
             for i, t0 in enumerate(current_dates)
         )
         
-        # Process results and compute capital path sequentially
+        # =====================================================================
+        # FIX: Recompute turnover and transaction costs with correct prev_weights
+        # =====================================================================
+        # Parallel execution computed portfolios independently (prev_weights=None),
+        # so turnover/costs are wrong. We now ONLY recalculate turnover/costs
+        # sequentially WITHOUT re-reading panel data (which is expensive).
+        
+        if verbose:
+            print(f"\n[parallel] Recomputing turnover for {len([r for r in parallel_results if r is not None])} periods...")
+        
         results = []
         diagnostics = []
         accounting_debug_rows = []
         capital_history = []
         current_capital = 1.0
         
+        # Track previous weights for turnover
+        prev_long_weights = None
+        prev_short_weights = None
+        
         for i, result in enumerate(parallel_results):
             if result is None:
                 continue
             
-            performance = result['performance']
+            # Get current weights
+            long_weights = result['long_weights']
+            short_weights = result['short_weights']
             
-            # Update capital using decimal return
+            # Get original performance (has correct asset returns, cash, etc.)
+            performance = result['performance'].copy()
+            
+            # ===== RECALCULATE TURNOVER (the only thing that changed) =====
+            gross_long = long_weights.sum() if len(long_weights) > 0 else 0.0
+            gross_short = abs(short_weights.sum()) if len(short_weights) > 0 else 0.0
+            
+            turnover_long = 0.0
+            turnover_short = 0.0
+            
+            if prev_long_weights is not None:
+                # Rebalancing: 0.5 factor for one-way turnover
+                all_tickers = long_weights.index.union(prev_long_weights.index)
+                curr_w = long_weights.reindex(all_tickers, fill_value=0.0)
+                prev_w = prev_long_weights.reindex(all_tickers, fill_value=0.0)
+                turnover_long = 0.5 * (curr_w - prev_w).abs().sum()
+            else:
+                # First period: full entry
+                turnover_long = long_weights.abs().sum()
+            
+            if prev_short_weights is not None:
+                # Rebalancing: 0.5 factor for one-way turnover
+                all_tickers = short_weights.index.union(prev_short_weights.index)
+                curr_w = short_weights.reindex(all_tickers, fill_value=0.0)
+                prev_w = prev_short_weights.reindex(all_tickers, fill_value=0.0)
+                turnover_short = 0.5 * (curr_w - prev_w).abs().sum()
+            else:
+                # First period: full entry
+                turnover_short = short_weights.abs().sum()
+            
+            total_turnover = turnover_long + turnover_short
+            
+            # Recalculate transaction costs
+            cost_bps = config.portfolio.total_cost_bps_per_side
+            transaction_cost = cost_bps * total_turnover / 10000.0
+            
+            # Update performance with corrected values
+            # Subtract old (wrong) transaction cost, add new (correct) one
+            old_txn_cost = performance['transaction_cost']
+            performance['turnover'] = total_turnover
+            performance['turnover_long'] = turnover_long
+            performance['turnover_short'] = turnover_short
+            performance['transaction_cost'] = transaction_cost
+            
+            # Adjust ls_return to reflect corrected transaction cost
+            performance['ls_return'] = performance['ls_return'] + old_txn_cost - transaction_cost
+            
+            # Update capital using corrected decimal return
             period_return_decimal = performance['ls_return']
             current_capital *= (1.0 + period_return_decimal)
             performance['capital'] = current_capital
             capital_history.append(current_capital)
+            
+            # Update prev_weights for next iteration
+            prev_long_weights = long_weights.copy()
+            prev_short_weights = short_weights.copy()
             
             # Accounting debug logging
             if config.debug.enable_accounting_debug:
@@ -529,6 +625,7 @@ def run_walk_forward_backtest(
                         "universe_size": len(result['eligible_metadata']),
                         "gross_long": float(result['long_weights'].abs().sum()) if len(result['long_weights']) > 0 else 0.0,
                         "gross_short": float(result['short_weights'].abs().sum()) if len(result['short_weights']) > 0 else 0.0,
+                        "cash_weight": performance.get("cash_weight", np.nan),
                         "naive_ls_ret": performance.get("naive_ls_ret", np.nan),
                         "cash_pnl": performance.get("cash_pnl", np.nan),
                         "transaction_cost": performance.get("transaction_cost", np.nan),
@@ -853,7 +950,7 @@ def run_walk_forward_backtest(
     # Save accounting debug log if enabled
     if accounting_debug_rows:
         debug_df = pd.DataFrame(accounting_debug_rows).set_index("date")
-        debug_path = config.paths.output_dir / "accounting_debug_log.csv"
+        debug_path = Path(config.paths.data_dir) / "accounting_debug_log.csv"
         debug_df.to_csv(debug_path)
         if verbose:
             print(f"\n[debug] Accounting debug log saved to: {debug_path}")
@@ -862,7 +959,6 @@ def run_walk_forward_backtest(
     # Save diagnostics if requested
     if config.compute.save_intermediate and len(diagnostics) > 0:
         import json
-        from pathlib import Path
         
         # Determine output path
         if config.compute.ic_output_path:
@@ -915,6 +1011,10 @@ def run_walk_forward_backtest(
             print(f"\n[save] Diagnostics saved to:")
             print(f"  Summary: {diag_csv_path}")
             print(f"  Full IC history: {ic_json_path}")
+    
+    # Store diagnostics in results_df as metadata
+    if len(diagnostics) > 0:
+        results_df.attrs['diagnostics'] = diagnostics
     
     return results_df
 
@@ -1303,6 +1403,229 @@ def analyze_performance(results_df: pd.DataFrame, config: ResearchConfig) -> Dic
     return stats
 
 
+def generate_trading_ledger(results_df: pd.DataFrame, config: ResearchConfig, output_path: str = None) -> pd.DataFrame:
+    """
+    Generate a detailed trading ledger with position-level details.
+    
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Backtest results from run_walk_forward_backtest
+    config : ResearchConfig
+        Configuration
+    output_path : str, optional
+        Path to save CSV output
+        
+    Returns
+    -------
+    pd.DataFrame
+        Trading ledger with columns: date, ticker, side, weight, return, pnl, etc.
+    """
+    from pathlib import Path
+    import ast
+    
+    ledger_rows = []
+    cumulative_pnl = 0.0
+    
+    for idx, row in results_df.iterrows():
+        date = idx
+        ls_return = row['ls_return']
+        
+        # Parse long positions
+        if 'long_tickers' in row and pd.notna(row['long_tickers']):
+            try:
+                if isinstance(row['long_tickers'], str):
+                    long_tickers = ast.literal_eval(row['long_tickers'])
+                else:
+                    long_tickers = row['long_tickers']
+                
+                if isinstance(long_tickers, dict):
+                    for ticker, weight in long_tickers.items():
+                        # Estimate individual position return (assuming uniform contribution)
+                        position_ret = row['long_ret'] * weight / (sum(long_tickers.values()) if long_tickers else 1.0)
+                        position_pnl = position_ret
+                        cumulative_pnl += position_pnl
+                        
+                        ledger_rows.append({
+                            'date': date,
+                            'ticker': ticker,
+                            'side': 'LONG',
+                            'weight': weight,
+                            'portfolio_return': row['long_ret'],
+                            'position_return': position_ret,
+                            'position_pnl': position_pnl,
+                            'cumulative_pnl': cumulative_pnl,
+                            'ls_return': ls_return,
+                            'transaction_cost': row.get('transaction_cost', 0.0),
+                            'borrow_cost': row.get('borrow_cost', 0.0)
+                        })
+            except:
+                pass
+        
+        # Parse short positions
+        if 'short_tickers' in row and pd.notna(row['short_tickers']):
+            try:
+                if isinstance(row['short_tickers'], str):
+                    short_tickers = ast.literal_eval(row['short_tickers'])
+                else:
+                    short_tickers = row['short_tickers']
+                
+                if isinstance(short_tickers, dict):
+                    for ticker, weight in short_tickers.items():
+                        # Estimate individual position return
+                        position_ret = row['short_ret'] * abs(weight) / (sum(abs(w) for w in short_tickers.values()) if short_tickers else 1.0)
+                        position_pnl = position_ret
+                        cumulative_pnl += position_pnl
+                        
+                        ledger_rows.append({
+                            'date': date,
+                            'ticker': ticker,
+                            'side': 'SHORT',
+                            'weight': weight,
+                            'portfolio_return': row['short_ret'],
+                            'position_return': position_ret,
+                            'position_pnl': position_pnl,
+                            'cumulative_pnl': cumulative_pnl,
+                            'ls_return': ls_return,
+                            'transaction_cost': row.get('transaction_cost', 0.0),
+                            'borrow_cost': row.get('borrow_cost', 0.0)
+                        })
+            except:
+                pass
+    
+    ledger_df = pd.DataFrame(ledger_rows)
+    
+    if len(ledger_df) > 0:
+        # Sort by date then side
+        ledger_df = ledger_df.sort_values(['date', 'side', 'ticker'])
+        
+        # Save to CSV if path provided
+        if output_path:
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            ledger_df.to_csv(output_path, index=False)
+            print(f"[save] Trading ledger saved to: {output_path}")
+    
+    return ledger_df
+
+
+def print_enhanced_summary(results_df: pd.DataFrame, diagnostics: list, config: ResearchConfig):
+    """
+    Print enhanced performance summary with detailed metrics.
+    
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        Backtest results
+    diagnostics : list
+        List of diagnostic dictionaries from walk-forward backtest
+    config : ResearchConfig
+        Configuration
+    """
+    if len(results_df) == 0:
+        print("[warn] No results to summarize")
+        return
+    
+    print("\n" + "="*80)
+    print("ENHANCED PERFORMANCE SUMMARY")
+    print("="*80)
+    
+    # Standard metrics
+    stats = analyze_performance(results_df, config)
+    for key, value in stats.items():
+        print(f"{key:25s}: {value}")
+    
+    # Position sizing metrics
+    print("\n" + "-"*80)
+    print("POSITION SIZING METRICS")
+    print("-"*80)
+    
+    n_long_mean = results_df['n_long'].mean()
+    n_short_mean = results_df['n_short'].mean()
+    n_long_std = results_df['n_long'].std()
+    n_short_std = results_df['n_short'].std()
+    
+    print(f"{'Avg Long Positions':25s}: {n_long_mean:.1f} ± {n_long_std:.1f}")
+    print(f"{'Avg Short Positions':25s}: {n_short_mean:.1f} ± {n_short_std:.1f}")
+    print(f"{'Avg Total Positions':25s}: {(n_long_mean + n_short_mean):.1f}")
+    
+    if 'gross_long' in results_df.columns:
+        print(f"{'Avg Gross Long':25s}: {results_df['gross_long'].mean():.2%}")
+    if 'gross_short' in results_df.columns:
+        print(f"{'Avg Gross Short':25s}: {results_df['gross_short'].mean():.2%}")
+    
+    # Return attribution
+    print("\n" + "-"*80)
+    print("RETURN ATTRIBUTION")
+    print("-"*80)
+    
+    total_return = (1 + results_df['ls_return']).prod() - 1
+    long_contribution = results_df['long_ret'].sum()
+    short_contribution = results_df['short_ret'].sum()
+    
+    # Calculate percentage contribution
+    if abs(long_contribution + short_contribution) > 0:
+        long_pct = long_contribution / (abs(long_contribution) + abs(short_contribution)) * 100
+        short_pct = short_contribution / (abs(long_contribution) + abs(short_contribution)) * 100
+    else:
+        long_pct = 0
+        short_pct = 0
+    
+    print(f"{'Total Return':25s}: {total_return * 100:.2f}%")
+    print(f"{'Long Contribution':25s}: {long_contribution * 100:.2f}% ({long_pct:.1f}% of total)")
+    print(f"{'Short Contribution':25s}: {short_contribution * 100:.2f}% ({short_pct:.1f}% of total)")
+    
+    # Cost analysis
+    if 'transaction_cost' in results_df.columns:
+        total_txn_cost = results_df['transaction_cost'].sum()
+        print(f"{'Total Transaction Costs':25s}: {total_txn_cost * 100:.2f}%")
+    
+    if 'borrow_cost' in results_df.columns:
+        total_borrow_cost = results_df['borrow_cost'].sum()
+        print(f"{'Total Borrow Costs':25s}: {total_borrow_cost * 100:.2f}%")
+    
+    # Feature selection summary
+    if diagnostics and len(diagnostics) > 0:
+        print("\n" + "-"*80)
+        print("FEATURE SELECTION SUMMARY")
+        print("-"*80)
+        
+        feature_counts = {}
+        universe_sizes = []
+        
+        for diag in diagnostics:
+            # Count feature occurrences
+            if 'selected_features' in diag:
+                for feat in diag['selected_features']:
+                    feature_counts[feat] = feature_counts.get(feat, 0) + 1
+            
+            # Track universe sizes
+            if 'universe_size' in diag:
+                universe_sizes.append(diag['universe_size'])
+        
+        # Top features by frequency
+        top_features = sorted(feature_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        
+        print(f"{'Avg Universe Size':25s}: {np.mean(universe_sizes):.1f} ETFs (min: {min(universe_sizes)}, max: {max(universe_sizes)})")
+        print(f"{'Avg Features Selected':25s}: {np.mean([diag['n_features'] for diag in diagnostics if 'n_features' in diag]):.1f}")
+        print(f"\n{'Top 10 Features by Frequency':}")
+        for i, (feat, count) in enumerate(top_features, 1):
+            freq = count / len(diagnostics) * 100
+            print(f"  {i:2d}. {feat:30s} - {count:2d}/{len(diagnostics)} periods ({freq:.1f}%)")
+        
+        # Sample IC values from last period
+        if diagnostics[-1].get('ic_values'):
+            print(f"\n{'Last Period IC Values (Top 5)':}")
+            ic_dict = diagnostics[-1]['ic_values']
+            abs_ic = {k: abs(v) for k, v in ic_dict.items() if pd.notna(v)}
+            top_ic = sorted(abs_ic.items(), key=lambda x: x[1], reverse=True)[:5]
+            for i, (feat, ic) in enumerate(top_ic, 1):
+                actual_ic = ic_dict[feat]
+                print(f"  {i}. {feat:30s}: IC = {actual_ic:+.4f}")
+    
+    print("\n" + "="*80)
+
+
 if __name__ == "__main__":
     print("Walk-forward engine module loaded.")
     print("\nKey function:")
@@ -1310,3 +1633,4 @@ if __name__ == "__main__":
     print("\nModel types:")
     print("  - 'momentum_rank': Simple baseline")
     print("  - 'supervised_binned': Supervised binning + feature selection")
+

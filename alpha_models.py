@@ -4,8 +4,8 @@ Alpha Models Module
 Generic alpha model interface for cross-sectional momentum strategies.
 
 Key principles:
-1. All supervised operations (binning, feature selection, model training) use ONLY training window data
-2. No look-ahead bias: binning cutpoints and feature selection from training window are applied to test dates
+1. All supervised operations (binning, feature selection, model training) should use ONLY training window data
+2. Look-ahead bias: binning cutpoints and feature selection from training window should be applied to test dates
 3. Model-agnostic interface: score_at_date(panel, t0, ...) returns scores for portfolio construction
 4. Binned features are treated on equal footing with raw features
 
@@ -453,6 +453,110 @@ def compute_cv_ic(
         return 0.0
 
 
+def compute_cv_ic_with_folds(
+    feature_values: pd.Series,
+    target_values: pd.Series,
+    config,
+    n_splits: int = 5,
+    is_already_binned: bool = False
+) -> Dict[str, any]:
+    """
+    PHASE 0: Enhanced CV-IC computation that returns fold-level ICs for sign consistency check.
+    
+    Returns both mean IC and individual fold ICs to enable sign consistency filtering.
+    This helps identify features with unstable IC direction across folds.
+    
+    Parameters
+    ----------
+    feature_values : pd.Series
+        Raw feature values
+    target_values : pd.Series
+        Target values (FwdRet_H)
+    config : ResearchConfig
+        Configuration
+    n_splits : int
+        Number of CV folds
+    is_already_binned : bool
+        Whether feature is pre-binned
+        
+    Returns
+    -------
+    dict
+        {
+            'mean_ic': float,           # Mean IC across folds
+            'fold_ics': list,           # Individual fold ICs
+            'sign_consistency': float   # Fraction of folds with same sign as median
+        }
+    """
+    # Remove NaN
+    valid_mask = feature_values.notna() & target_values.notna()
+    X = feature_values[valid_mask].values
+    y = target_values[valid_mask].values
+    idx = feature_values[valid_mask].index
+    
+    if len(X) < n_splits * 10:
+        # Insufficient data for CV
+        ic = compute_ic(pd.Series(X, index=idx), pd.Series(y, index=idx), method='spearman')
+        return {
+            'mean_ic': ic,
+            'fold_ics': [ic],
+            'sign_consistency': 1.0
+        }
+    
+    # K-Fold cross-validation
+    kf = KFold(n_splits=n_splits, shuffle=False)
+    fold_ics = []
+    
+    if is_already_binned:
+        # Feature already binned, just compute IC per fold
+        for train_idx, test_idx in kf.split(X):
+            X_test = X[test_idx]
+            y_test = y[test_idx]
+            if len(X_test) > 2:
+                ic = compute_ic(pd.Series(X_test), pd.Series(y_test), method='spearman')
+                fold_ics.append(ic)
+    else:
+        # Fit bins on each training fold, evaluate on test fold
+        for train_idx, test_idx in kf.split(X):
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            
+            # Fit bins on training fold
+            boundaries = fit_supervised_bins(
+                pd.Series(X_train),
+                pd.Series(y_train),
+                max_depth=config.features.bin_max_depth,
+                min_samples_leaf=config.features.bin_min_samples_leaf,
+                n_bins=config.features.n_bins,
+                random_state=config.features.random_state
+            )
+            
+            # Apply bins to test fold
+            X_test_binned = np.digitize(X_test, boundaries, right=False)
+            
+            # Compute IC on test fold
+            if len(X_test) > 2:
+                ic = compute_ic(pd.Series(X_test_binned), pd.Series(y_test), method='spearman')
+                fold_ics.append(ic)
+    
+    if len(fold_ics) == 0:
+        return {'mean_ic': 0.0, 'fold_ics': [], 'sign_consistency': 0.0}
+    
+    # Compute sign consistency
+    median_ic = np.median(fold_ics)
+    if median_ic == 0:
+        sign_consistency = 0.0
+    else:
+        same_sign_count = sum(np.sign(ic) == np.sign(median_ic) for ic in fold_ics)
+        sign_consistency = same_sign_count / len(fold_ics)
+    
+    return {
+        'mean_ic': np.mean(fold_ics),
+        'fold_ics': fold_ics,
+        'sign_consistency': sign_consistency
+    }
+
+
 def train_alpha_model(
     panel: pd.DataFrame,
     universe_metadata: pd.DataFrame,
@@ -629,36 +733,50 @@ def train_alpha_model(
     
     print(f"[train] Evaluating {len(candidate_features)} candidate features ({len(base_features)} raw + {len(binning_dict)} binned)")
     
-    # Compute CV-IC for each candidate (includes binning in CV loop)
-    # PARALLELIZED: Compute CV-ICs in parallel across features
+    # PHASE 0: Compute CV-IC with fold-level details for sign consistency filtering
     from joblib import Parallel, delayed
     
-    def compute_single_cv_ic(feat, train_data, target_col, config):
-        """Helper function for parallel CV-IC computation."""
+    def compute_single_cv_ic_detailed(feat, train_data, target_col, config):
+        """Helper function for parallel CV-IC computation with fold details."""
         is_binned = feat.endswith('_Bin')
-        cv_ic = compute_cv_ic(
+        cv_ic_result = compute_cv_ic_with_folds(
             train_data[feat],
             train_data[target_col],
             config,
             n_splits=5,
             is_already_binned=is_binned
         )
-        return feat, cv_ic
+        return feat, cv_ic_result
     
     # Parallel execution across features
     n_jobs = config.compute.n_jobs if hasattr(config.compute, 'n_jobs') else -1
     cv_ic_results = Parallel(n_jobs=n_jobs, backend='threading')(
-        delayed(compute_single_cv_ic)(feat, train_data, target_col, config)
+        delayed(compute_single_cv_ic_detailed)(feat, train_data, target_col, config)
         for feat in candidate_features
     )
     
-    cv_ic_values = {feat: ic for feat, ic in cv_ic_results}
-    cv_ic_series = pd.Series(cv_ic_values).dropna()
+    # Extract mean ICs and sign consistency
+    cv_ic_values = {feat: result['mean_ic'] for feat, result in cv_ic_results}
+    sign_consistency_values = {feat: result['sign_consistency'] for feat, result in cv_ic_results}
     
-    # Select features with |CV-IC| >= threshold
+    cv_ic_series = pd.Series(cv_ic_values).dropna()
+    sign_consistency_series = pd.Series(sign_consistency_values)
+    
+    # PHASE 0 FILTER: Require 80%+ sign consistency to prevent signal reversal
+    min_sign_consistency = 0.80
+    sign_stable_mask = sign_consistency_series >= min_sign_consistency
+    
+    n_unstable = (~sign_stable_mask).sum()
+    if n_unstable > 0:
+        print(f"[train] PHASE 0: Filtered out {n_unstable} features with sign consistency < {min_sign_consistency:.0%}")
+    
+    # Apply both filters: IC threshold AND sign consistency
     abs_cv_ic = cv_ic_series.abs()
-    selected_mask = abs_cv_ic >= config.features.ic_threshold
-    selected_features = abs_cv_ic[selected_mask].nlargest(config.features.max_features).index.tolist()
+    ic_threshold_mask = abs_cv_ic >= config.features.ic_threshold
+    combined_mask = ic_threshold_mask & sign_stable_mask
+    
+    # Select top features that pass both filters
+    selected_features = abs_cv_ic[combined_mask].nlargest(config.features.max_features).index.tolist()
     
     if len(selected_features) == 0:
         warnings.warn("No features passed CV-IC threshold, using momentum rank")
