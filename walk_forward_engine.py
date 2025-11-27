@@ -26,7 +26,8 @@ from pathlib import Path
 import warnings
 
 from config import ResearchConfig
-from alpha_models import train_alpha_model, AlphaModel
+from alpha_models import AlphaModel
+from feature_selection import per_window_pipeline
 from portfolio_construction import construct_portfolio, evaluate_portfolio_return
 from regime import compute_regime_series, get_portfolio_mode_for_regime
 from attribution_analysis import compute_attribution_analysis, save_attribution_results
@@ -237,8 +238,8 @@ def run_walk_forward_backtest(
        where t_train_start = t0 - TRAINING_WINDOW_DAYS
              t_train_end = t0 - 1 - HOLDING_PERIOD_DAYS
     
-    2. Train model on training window:
-       model = train_alpha_model(panel, metadata, t_train_start, t_train_end, config)
+    2. Train model on training window with feature selection:
+       model, diagnostics = per_window_pipeline(panel_train, metadata, t0, config)
     
     3. Get eligible universe at t0
     
@@ -365,26 +366,33 @@ def run_walk_forward_backtest(
                     print("[skip] Invalid training window")
                 return None
             
-            # Train model
+            # Train model using per_window_pipeline
             if verbose_inner:
-                print(f"[train] Training {model_type} model...")
+                print(f"[train] Training {model_type} model with feature selection...")
             
             train_start = time.time()
             try:
-                model, selected_features, ic_series = train_alpha_model(
-                    panel=panel_df,
-                    universe_metadata=universe_metadata,
-                    t_train_start=t_train_start,
-                    t_train_end=t_train_end,
-                    config=config,
-                    model_type=model_type
+                # Extract training panel
+                train_mask = (
+                    (panel_df.index.get_level_values('Date') >= t_train_start) &
+                    (panel_df.index.get_level_values('Date') <= t_train_end)
+                )
+                panel_train = panel_df[train_mask]
+                
+                # Train model with feature selection (returns model + diagnostics)
+                model, all_diagnostics = per_window_pipeline(
+                    panel=panel_train,
+                    metadata=universe_metadata,
+                    t0=t0,
+                    config=config
                 )
                 
+                # Extract diagnostics
                 diagnostics_entry = {
                     'date': t0,
-                    'n_features': len(selected_features),
-                    'selected_features': selected_features,
-                    'ic_values': ic_series.to_dict() if ic_series is not None else {}
+                    'n_features': len(model.selected_features) if model else 0,
+                    'selected_features': model.selected_features if model else [],
+                    **all_diagnostics  # Include stage counts, timings, etc.
                 }
                 train_elapsed = time.time() - train_start
             except Exception as e:
@@ -698,28 +706,34 @@ def run_walk_forward_backtest(
                     continue
             
             # =====================================================================
-            # 2. Train model
+            # 2. Train model with feature selection
             # =====================================================================
             if verbose:
-                print(f"[train] Training {model_type} model...")
+                print(f"[train] Training {model_type} model with feature selection...")
             
             train_start = time.time()
             try:
-                model, selected_features, ic_series = train_alpha_model(
-                    panel=panel_df,
-                    universe_metadata=universe_metadata,
-                    t_train_start=t_train_start,
-                    t_train_end=t_train_end,
-                    config=config,
-                    model_type=model_type
+                # Extract training panel
+                train_mask = (
+                    (panel_df.index.get_level_values('Date') >= t_train_start) &
+                    (panel_df.index.get_level_values('Date') <= t_train_end)
+                )
+                panel_train = panel_df[train_mask]
+                
+                # Train model with feature selection (returns model + diagnostics)
+                model, all_diagnostics = per_window_pipeline(
+                    panel=panel_train,
+                    metadata=universe_metadata,
+                    t0=t0,
+                    config=config
                 )
                 
                 # Record diagnostics
                 diagnostics_entry = {
                     'date': t0,
-                    'n_features': len(selected_features),
-                    'selected_features': selected_features,
-                    'ic_values': ic_series.to_dict() if ic_series is not None else {}
+                    'n_features': len(model.selected_features) if model else 0,
+                    'selected_features': model.selected_features if model else [],
+                    **all_diagnostics  # Include stage counts, timings, etc.
                 }
                 train_elapsed = time.time() - train_start
                 total_train_time += train_elapsed
