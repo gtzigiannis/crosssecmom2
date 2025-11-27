@@ -8,15 +8,17 @@ This test verifies that:
 4. Signal features are consistently selected
 5. No exceptions during multi-window walk-forward
 
-Run with: python test_walk_forward_integration.py
+Run with: pytest test_walk_forward_integration.py -v -s
 """
 
 import numpy as np
 import pandas as pd
+import pytest
 from datetime import datetime, timedelta
+from collections import Counter
 
 # Import functions to test
-from walk_forward_engine import walk_forward_backtest
+from walk_forward_engine import run_walk_forward_backtest
 from config import ResearchConfig
 
 
@@ -24,7 +26,8 @@ from config import ResearchConfig
 # Test Fixtures: Synthetic Data with Known Signal
 # ============================================================================
 
-def create_synthetic_panel_with_signal():
+@pytest.fixture
+def synthetic_panel_with_signal():
     """
     Generate synthetic panel with known signal features.
     
@@ -38,11 +41,11 @@ def create_synthetic_panel_with_signal():
     """
     np.random.seed(42)
     
-    # Panel dimensions
-    n_days = 500
-    n_tickers = 20
-    n_signal_features = 5
-    n_noise_features = 5
+    # Panel dimensions - SMALLER for fast testing
+    n_days = 300  # Reduced from 500
+    n_tickers = 10  # Reduced from 20
+    n_signal_features = 3  # Reduced from 5
+    n_noise_features = 2  # Reduced from 5
     n_features = n_signal_features + n_noise_features
     
     # Create date range
@@ -121,15 +124,15 @@ def create_synthetic_panel_with_signal():
     
     # Create config
     config = ResearchConfig()
-    config.TRAINING_WINDOW_DAYS = 200
+    config.TRAINING_WINDOW_DAYS = 120  # Reduced from 200
     config.STEP_SIZE_DAYS = 60
     config.HOLDING_PERIOD_DAYS = 5
-    config.MIN_OBSERVATIONS = 100
+    config.MIN_OBSERVATIONS = 50  # Reduced from 100
     config.FORMATION_IC_THRESHOLD = 0.00  # Low threshold to ensure features pass
     config.MIN_STABILITY_PVALUE = 0.30  # Lower threshold for test
-    config.MAX_FEATURES_SELECTED = 10
-    config.ALPHA_ELASTICNET = [0.01, 0.1, 1.0]
-    config.L1_RATIO = [0.5, 0.7, 0.9]
+    config.MAX_FEATURES_SELECTED = 5  # Reduced from 10
+    config.ALPHA_ELASTICNET = [0.01, 0.1]  # Reduced grid
+    config.L1_RATIO = [0.5, 0.9]  # Reduced grid
     
     return panel, metadata, config
 
@@ -138,7 +141,7 @@ def create_synthetic_panel_with_signal():
 # Integration Tests
 # ============================================================================
 
-def test_walk_forward_with_feature_selection():
+def test_walk_forward_with_feature_selection(synthetic_panel_with_signal):
     """
     Test walk-forward backtest with feature selection pipeline.
     
@@ -149,10 +152,10 @@ def test_walk_forward_with_feature_selection():
     4. Signal features (0-4) are frequently selected
     5. Diagnostics captured per window
     """
-    panel, metadata, config = create_synthetic_panel_with_signal()
+    panel, metadata, config = synthetic_panel_with_signal
     
     # Run walk-forward backtest
-    results = walk_forward_backtest(
+    results = run_walk_forward_backtest(
         panel_df=panel,
         universe_metadata=metadata,
         config=config,
@@ -205,29 +208,43 @@ def test_walk_forward_with_feature_selection():
         all_selected.extend(diag['selected_features'])
     
     # Count feature occurrences
-    from collections import Counter
     feature_counts = Counter(all_selected)
     
-    # Signal features (0-4) should appear more often than noise features (5-9)
-    signal_count = sum(feature_counts.get(f'feature_{i}', 0) for i in range(5))
-    noise_count = sum(feature_counts.get(f'feature_{i}', 0) for i in range(5, 10))
+    # Signal features (0-2) should appear more often than noise features (3-4)
+    signal_count = sum(feature_counts.get(f'feature_{i}', 0) for i in range(3))
+    noise_count = sum(feature_counts.get(f'feature_{i}', 0) for i in range(3, 5))
     
     print(f"\nFeature selection statistics:")
-    print(f"  Signal features (0-4) selected: {signal_count} times")
-    print(f"  Noise features (5-9) selected: {noise_count} times")
-    print(f"  Top 5 features: {feature_counts.most_common(5)}")
+    print(f"  Signal features (0-2) selected: {signal_count} times")
+    print(f"  Noise features (3-4) selected: {noise_count} times")
+    print(f"  Top 3 features: {feature_counts.most_common(3)}")
     
-    # Signal features should dominate (at least 60% of selections)
+    # ANCHOR ASSERTION: Signal features should dominate
+    # Intuition: With 120-day training windows and moderately strong signal (correlation ~0.3),
+    # ElasticNet should consistently identify signal features. We expect:
+    # - Signal features selected 60%+ of the time (strong bias toward predictive features)
+    # - At least 2x more signal selections than noise selections
     if signal_count + noise_count > 0:
         signal_ratio = signal_count / (signal_count + noise_count)
-        assert signal_ratio >= 0.5, (
-            f"Signal features should be selected frequently, "
-            f"but only {signal_ratio:.1%} of selections were signal features"
+        assert signal_ratio >= 0.6, (
+            f"ANCHOR FAILURE: Signal features should be selected ≥60% of time. "
+            f"Got {signal_ratio:.1%}. This suggests feature selection is not working properly. "
+            f"Signal count: {signal_count}, Noise count: {noise_count}"
         )
-        print(f"  Signal ratio: {signal_ratio:.1%} (target: ≥50%)")
+        print(f"  ✓ Signal ratio: {signal_ratio:.1%} (target: ≥60%)")
+        
+        # Secondary check: signal should be at least 2x noise
+        if noise_count > 0:
+            signal_to_noise = signal_count / noise_count
+            assert signal_to_noise >= 2.0, (
+                f"ANCHOR FAILURE: Signal-to-noise ratio too low. "
+                f"Got {signal_to_noise:.1f}x, expected ≥2.0x. "
+                f"Feature selection should strongly favor predictive features."
+            )
+            print(f"  ✓ Signal-to-noise ratio: {signal_to_noise:.1f}x (target: ≥2.0x)")
 
 
-def test_walk_forward_model_subset_design():
+def test_walk_forward_model_subset_design(synthetic_panel_with_signal):
     """
     Test that models use subset design (operate on selected features only).
     
@@ -236,12 +253,12 @@ def test_walk_forward_model_subset_design():
     2. Model's scaling_params contain only selected features
     3. Scoring works with subset features
     """
-    panel, metadata, config = create_synthetic_panel_with_signal()
+    panel, metadata, config = synthetic_panel_with_signal
     
     # Run single rebalance
     config.STEP_SIZE_DAYS = 999  # Large step to get only one rebalance
     
-    results = walk_forward_backtest(
+    results = run_walk_forward_backtest(
         panel_df=panel,
         universe_metadata=metadata,
         config=config,
@@ -269,20 +286,34 @@ def test_walk_forward_model_subset_design():
     # Basic checks
     assert n_features > 0, "Should select at least some features"
     assert len(selected_features) == n_features, "Feature count should match"
-    assert n_features < 10, "Should not select all features (subset design)"
+    
+    # ANCHOR ASSERTION: Subset design constraint
+    # Intuition: With 5 total features and IC/stability filtering,
+    # we should NOT select all features. A proper subset design should
+    # select 2-4 features typically (40-80% of candidates).
+    assert n_features < 5, (
+        f"ANCHOR FAILURE: Selected ALL features ({n_features}/5). "
+        f"Subset design should be selective, not use all candidates. "
+        f"This suggests feature selection filters are not working."
+    )
+    assert n_features >= 2, (
+        f"ANCHOR FAILURE: Too few features selected ({n_features}). "
+        f"With synthetic signal data, should select at least 2 features."
+    )
+    print(f"  ✓ Feature count in valid range: {n_features}/5 features (40-80%)")
 
 
-def test_walk_forward_parallel_execution():
+def test_walk_forward_parallel_execution(synthetic_panel_with_signal):
     """
     Test parallel execution path produces same results as sequential.
     
     Note: Due to potential numerical differences in parallel execution,
     we check that results are similar, not identical.
     """
-    panel, metadata, config = create_synthetic_panel_with_signal()
+    panel, metadata, config = synthetic_panel_with_signal
     
     # Run sequential
-    results_seq = walk_forward_backtest(
+    results_seq = run_walk_forward_backtest(
         panel_df=panel,
         universe_metadata=metadata,
         config=config,
@@ -296,7 +327,7 @@ def test_walk_forward_parallel_execution():
     )
     
     # Run parallel
-    results_par = walk_forward_backtest(
+    results_par = run_walk_forward_backtest(
         panel_df=panel,
         universe_metadata=metadata,
         config=config,
@@ -331,46 +362,29 @@ def test_walk_forward_parallel_execution():
     print(f"  Parallel returns: {par_vals}")
     print(f"  Correlation: {correlation:.4f}")
     
+    # ANCHOR ASSERTION: Parallel consistency check
+    # Intuition: Parallel and sequential should produce nearly identical results
+    # since there's no randomness in feature selection or model training.
+    # We expect correlation > 0.95, ideally > 0.99.
     assert correlation > 0.95, (
-        f"Parallel and sequential results should be highly correlated, "
-        f"got correlation={correlation:.4f}"
+        f"ANCHOR FAILURE: Parallel/sequential results diverged too much. "
+        f"Correlation = {correlation:.4f}, expected > 0.95. "
+        f"This suggests parallel execution has a bug or race condition."
     )
+    print(f"  ✓ Parallel consistency: correlation = {correlation:.4f} (target: >0.95)")
+    
+    # Additional check: mean returns should be similar
+    seq_mean = np.mean(seq_vals)
+    par_mean = np.mean(par_vals)
+    mean_diff = abs(seq_mean - par_mean)
+    assert mean_diff < 0.01, (
+        f"ANCHOR FAILURE: Mean returns differ too much: "
+        f"sequential={seq_mean:.4f}, parallel={par_mean:.4f}, diff={mean_diff:.4f}"
+    )
+    print(f"  ✓ Mean consistency: |{seq_mean:.4f} - {par_mean:.4f}| < 0.01")
 
 
 if __name__ == '__main__':
-    print("="*70)
-    print("Test 1: Walk-forward with feature selection")
-    print("="*70)
-    try:
-        test_walk_forward_with_feature_selection()
-        print("✓ PASSED")
-    except AssertionError as e:
-        print(f"✗ FAILED: {e}")
-    except Exception as e:
-        print(f"✗ ERROR: {e}")
-    
-    print("\n" + "="*70)
-    print("Test 2: Model subset design")
-    print("="*70)
-    try:
-        test_walk_forward_model_subset_design()
-        print("✓ PASSED")
-    except AssertionError as e:
-        print(f"✗ FAILED: {e}")
-    except Exception as e:
-        print(f"✗ ERROR: {e}")
-    
-    print("\n" + "="*70)
-    print("Test 3: Parallel execution")
-    print("="*70)
-    try:
-        test_walk_forward_parallel_execution()
-        print("✓ PASSED")
-    except AssertionError as e:
-        print(f"✗ FAILED: {e}")
-    except Exception as e:
-        print(f"✗ ERROR: {e}")
-    
-    print("\n" + "="*70)
-    print("All tests completed")
-    print("="*70)
+    # Run with pytest
+    import sys
+    pytest.main([__file__, '-v', '-s'] + sys.argv[1:])
