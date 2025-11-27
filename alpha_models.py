@@ -1,35 +1,28 @@
 """
-Alpha Models Module
-===================
-Generic alpha model interface for cross-sectional momentum strategies.
+Alpha Models Module (Refactored)
+==================================
+Provides model wrappers that store trained parameters and apply them at t0.
 
-Key principles:
-1. All supervised operations (binning, feature selection, model training) should use ONLY training window data
-2. Look-ahead bias: binning cutpoints and feature selection from training window should be applied to test dates
-3. Model-agnostic interface: score_at_date(panel, t0, ...) returns scores for portfolio construction
-4. Binned features are treated on equal footing with raw features
+This module has been refactored to separate "models only" from feature selection:
+- feature_selection.py: Contains the canonical feature selection pipeline
+- alpha_models.py: Contains model wrappers that store and apply trained parameters
 
-Model lifecycle:
-1. train_alpha_model(panel, t_train_start, t_train_end, ...) -> model_object
-   - Extracts training window data
-   - Performs supervised binning on selected features
-   - Performs supervised feature selection (IC-based or other)
-   - Fits model on selected features + binned features
-   
-2. model_object.score_at_date(panel, t0, ...) -> pd.Series
-   - Applies stored binning cutpoints to features at t0
-   - Computes scores using trained model
-   - Returns cross-sectional scores for portfolio formation
+Model Interface:
+    All models implement: score_at_date(panel, t0, universe_metadata, config) -> pd.Series
+
+Available Models:
+    - MomentumRankModel: Simple baseline (rank a single momentum feature)
+    - ElasticNetWindowModel: Linear model with stored scaling params and ElasticNet coefficients
+    
+DEPRECATED FUNCTIONS:
+    - train_alpha_model(): Use feature_selection.per_window_pipeline() instead
+    - All Phase 2 feature selection helpers (fit_supervised_bins, compute_cv_ic, etc.)
+      are superseded by feature_selection.py
 """
 
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Optional, Tuple
-from sklearn.tree import DecisionTreeRegressor
-from sklearn.model_selection import KFold
-from sklearn.feature_selection import mutual_info_regression
-from sklearn.linear_model import ElasticNetCV
-from scipy.stats import spearmanr
 import warnings
 
 
@@ -108,8 +101,176 @@ class MomentumRankModel(AlphaModel):
         return scores
 
 
+class ElasticNetWindowModel(AlphaModel):
+    """
+    Per-window linear model storing selected features, scaling params, and fitted ElasticNet.
+    
+    This model is returned by feature_selection.per_window_pipeline() and contains:
+    - selected_features: List of feature names selected by the pipeline
+    - scaling_params: Dict with 'median' and 'mad' ONLY for selected features
+    - binning_params: Optional dict with binning boundaries for supervised-binned features
+    - fitted_model: ElasticNet model REFIT on selected features only
+    
+    Scoring at t0:
+    - Extracts ONLY selected features at t0
+    - Applies stored binning (if any)
+    - Standardizes using stored median/MAD from training
+    - Predicts using refit ElasticNet (trained on selected features)
+    - Returns pd.Series of scores indexed by ticker
+    
+    CRITICAL: All transformations use ONLY parameters learned during training.
+    No label information or statistics from t0 are used.
+    The model operates on the SUBSET of selected features only.
+    """
+    
+    def __init__(
+        self,
+        selected_features: List[str],
+        scaling_params: Dict,
+        fitted_model: object,
+        binning_params: Optional[Dict] = None
+    ):
+        """
+        Parameters
+        ----------
+        selected_features : list
+            Feature names selected by ElasticNet (non-zero coefficients)
+        scaling_params : dict
+            {'median': {feat: value}, 'mad': {feat: value}}
+            Scaling parameters for SELECTED features only (computed on training window)
+        fitted_model : object
+            ElasticNet model REFIT on selected features only
+        binning_params : dict, optional
+            {feature_name: bin_boundaries} for supervised-binned features
+            If None, no binning is applied
+        """
+        self.selected_features = selected_features
+        self.scaling_params = scaling_params
+        self.fitted_model = fitted_model
+        self.binning_params = binning_params or {}
+    
+    def _apply_binning(self, cross_section: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply stored binning boundaries to create binned features.
+        
+        Uses digitize to assign each value to a bin based on training-window boundaries.
+        """
+        cs = cross_section.copy()
+        
+        for feat, boundaries in self.binning_params.items():
+            if feat not in cs.columns:
+                continue
+            
+            # Digitize: bin i if boundaries[i-1] <= x < boundaries[i]
+            binned = np.digitize(cs[feat].values, boundaries, right=False)
+            cs[f'{feat}_binned'] = binned.astype('float32')
+        
+        return cs
+    
+    def _apply_scaling(self, cross_section: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply stored robust standardization (median/MAD) from training window.
+        
+        CRITICAL: Uses training-window statistics, not t0 statistics.
+        """
+        cs = cross_section.copy()
+        
+        for feat in cross_section.columns:
+            if feat in self.scaling_params['median']:
+                median_train = self.scaling_params['median'][feat]
+                mad_train = self.scaling_params['mad'][feat]
+                cs[feat] = (cross_section[feat] - median_train) / mad_train
+        
+        return cs
+    
+    def score_at_date(
+        self,
+        panel: pd.DataFrame,
+        t0: pd.Timestamp,
+        universe_metadata: pd.DataFrame,
+        config
+    ) -> pd.Series:
+        """
+        Compute scores at t0 using stored model and parameters.
+        
+        Steps:
+        1. Extract t0 cross-section
+        2. Apply stored binning (if any)
+        3. Extract ONLY selected features (model was refit on these)
+        4. Apply stored standardization (median/MAD from training)
+        5. Predict using refit ElasticNet
+        6. Return scores as pd.Series
+        
+        CRITICAL: Uses only selected_features (the model was refit on this subset).
+        scaling_params contains ONLY these features.
+        
+        Returns
+        -------
+        pd.Series
+            Scores indexed by ticker (NaN for tickers with missing features)
+        """
+        try:
+            cross_section = panel.loc[t0].copy()
+        except KeyError:
+            return pd.Series(dtype=float)
+        
+        # Apply binning if configured
+        if self.binning_params:
+            cross_section = self._apply_binning(cross_section)
+        
+        # Extract ONLY selected features (model was refit on these)
+        available_features = [f for f in self.selected_features if f in cross_section.columns]
+        
+        if len(available_features) == 0:
+            warnings.warn(f"No selected features available at {t0}")
+            return pd.Series(dtype=float)
+        
+        if len(available_features) < len(self.selected_features):
+            warnings.warn(f"Only {len(available_features)}/{len(self.selected_features)} selected features available at {t0}")
+        
+        # Extract feature matrix in training order
+        X_t0 = cross_section[self.selected_features].copy()
+        
+        # Apply stored standardization (only for selected features)
+        X_t0_scaled = self._apply_scaling(X_t0)
+        
+        # Check for NaNs (assets with missing features)
+        has_nan = X_t0_scaled.isna().any(axis=1)
+        
+        # Predict scores
+        scores = pd.Series(np.nan, index=cross_section.index, name='score')
+        
+        if not has_nan.all():
+            X_clean = X_t0_scaled[~has_nan].values
+            scores[~has_nan] = self.fitted_model.predict(X_clean)
+        
+        return scores
+
+
+# ============================================================================
+# DEPRECATED: Old Phase 2 Feature Selection Code
+# ============================================================================
+# 
+# The functions below (fit_supervised_bins, compute_ic, compute_cv_ic, etc.)
+# are DEPRECATED and superseded by feature_selection.py.
+#
+# DO NOT USE these functions in new code. They are kept temporarily for 
+# backward compatibility with existing walk-forward code that hasn't been
+# migrated yet.
+#
+# For new feature selection, use:
+#   from feature_selection import per_window_pipeline
+#
+# ============================================================================
+
+
 class SupervisedBinnedModel(AlphaModel):
     """
+    DEPRECATED: Use ElasticNetWindowModel instead.
+    
+    This class is kept for backward compatibility with existing walk-forward code.
+    New code should use ElasticNetWindowModel returned by feature_selection.per_window_pipeline().
+    
     Alpha model with supervised binning and feature selection inside training window.
     
     Training phase:
@@ -797,6 +958,17 @@ def train_alpha_model(
     model_type: str = 'supervised_binned'
 ) -> AlphaModel:
     """
+    DEPRECATED: Use feature_selection.per_window_pipeline() instead.
+    
+    This function is kept for backward compatibility with existing walk-forward code
+    that hasn't been migrated to the new pipeline yet.
+    
+    NEW CODE SHOULD USE:
+        from feature_selection import per_window_pipeline
+        scores, diagnostics, model = per_window_pipeline(
+            X_train, y_train, X_t0, dates_train, approved_features, ...
+        )
+    
     Train an alpha model on the specified training window.
     
     This function orchestrates:
