@@ -356,10 +356,19 @@ def _optimize_one_side(
             constraints.append(cp.sum(w[cluster_mask]) <= cluster_cap_dict[cid])
     
     # Solve optimization
+    # Try solvers in order of preference: CLARABEL (modern, robust), OSQP, SCS
     problem = cp.Problem(objective, constraints)
     
     try:
-        problem.solve(solver=cp.ECOS, verbose=False)
+        # CLARABEL is a modern interior-point solver that handles QP/SOCP well
+        # It's the recommended replacement for ECOS
+        for solver in [cp.CLARABEL, cp.OSQP, cp.SCS]:
+            try:
+                problem.solve(solver=solver, verbose=False)
+                if problem.status in ['optimal', 'optimal_inaccurate']:
+                    break
+            except Exception:
+                continue
         
         if problem.status not in ['optimal', 'optimal_inaccurate']:
             warnings.warn(f"[{side}] Optimization status: {problem.status}, using equal weights")

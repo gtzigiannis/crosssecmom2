@@ -27,10 +27,194 @@ import warnings
 
 from config import ResearchConfig
 from alpha_models import AlphaModel
-from feature_selection import per_window_pipeline
+from feature_selection import train_window_model, formation_fdr, formation_tune_elasticnet, compute_time_decay_weights
 from portfolio_construction import construct_portfolio, evaluate_portfolio_return
 from regime import compute_regime_series, get_portfolio_mode_for_regime
 from attribution_analysis import compute_attribution_analysis, save_attribution_results
+
+
+def compute_formation_artifacts(
+    panel_df: pd.DataFrame,
+    universe_metadata: pd.DataFrame,
+    t0: pd.Timestamp,
+    config: ResearchConfig,
+    verbose: bool = False
+) -> Dict:
+    """
+    Compute Formation artifacts for v3 pipeline.
+    
+    Formation window is a longer lookback period (default 5 years) used to:
+    1. Approve features via formation_fdr (IC + FDR filter)
+    2. Tune ElasticNet hyperparameters (alpha, l1_ratio)
+    
+    These artifacts are then used by the Training window (default 1 year)
+    to fit the final model with soft ranking and no CV.
+    
+    Parameters
+    ----------
+    panel_df : pd.DataFrame
+        Panel with (Date, Ticker) MultiIndex
+    universe_metadata : pd.DataFrame
+        ETF metadata
+    t0 : pd.Timestamp
+        Current rebalance date
+    config : ResearchConfig
+        Configuration with formation_years, training_years, etc.
+    verbose : bool
+        Print diagnostic information
+        
+    Returns
+    -------
+    dict or None
+        Formation artifacts with keys:
+        - 'approved_features': List of features that passed IC+FDR
+        - 'best_alpha': Optimal ElasticNet alpha from Formation CV
+        - 'best_l1_ratio': Optimal ElasticNet l1_ratio from Formation CV
+        - 'formation_diagnostics': Dict with IC values, FDR stats, etc.
+        Returns None if Formation window is invalid or computation fails.
+    """
+    # Compute Formation window
+    formation_days = int(config.features.formation_years * 252)  # Business days
+    t_formation_start = t0 - pd.Timedelta(days=formation_days)
+    t_formation_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
+    
+    if verbose:
+        print(f"[formation] Window: [{t_formation_start.date()}, {t_formation_end.date()}] ({formation_days} days)")
+    
+    # Check Formation window is valid
+    if t_formation_end <= t_formation_start:
+        if verbose:
+            print("[warn] Invalid Formation window")
+        return None
+    
+    # Extract Formation panel
+    formation_mask = (
+        (panel_df.index.get_level_values('Date') >= t_formation_start) &
+        (panel_df.index.get_level_values('Date') <= t_formation_end)
+    )
+    panel_formation = panel_df[formation_mask]
+    
+    if len(panel_formation) == 0:
+        if verbose:
+            print("[warn] Empty Formation panel")
+        return None
+    
+    # Prepare data for formation_fdr
+    target_col = f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}'
+    if target_col not in panel_formation.columns:
+        if verbose:
+            print(f"[warn] Target column {target_col} not found in Formation panel")
+        return None
+    
+    # Identify feature columns (exclude non-feature columns)
+    exclude_cols = ['Close', 'Ticker', 'ADV_63', 'ADV_63_Rank', 'market_cap'] + \
+                   [c for c in panel_formation.columns if c.startswith('FwdRet')]
+    feature_cols = [c for c in panel_formation.columns if c not in exclude_cols and not c.startswith('_')]
+    
+    if len(feature_cols) == 0:
+        if verbose:
+            print("[warn] No feature columns found in Formation panel")
+        return None
+    
+    # Get formation dates
+    dates_formation = panel_formation.index.get_level_values('Date')
+    
+    # Prepare X (features) and y (target)
+    X_formation = panel_formation[feature_cols].astype(np.float32)
+    y_formation = panel_formation[target_col].astype(np.float64)
+    
+    # Run formation_fdr to approve features
+    import time as time_module
+    fdr_start = time_module.time()
+    
+    try:
+        approved_features, fdr_diagnostics = formation_fdr(
+            X=X_formation,
+            y=y_formation,
+            dates=dates_formation,
+            half_life=config.features.formation_halflife_days,
+            fdr_level=config.features.formation_fdr_q_threshold,
+            n_jobs=4
+        )
+        fdr_elapsed = time_module.time() - fdr_start
+        
+        if verbose:
+            print(f"[formation] FDR approved {len(approved_features)} features in {fdr_elapsed:.2f}s")
+        
+        if len(approved_features) == 0:
+            if verbose:
+                print("[warn] No features approved by formation_fdr")
+            return None
+            
+    except Exception as e:
+        if verbose:
+            print(f"[error] formation_fdr failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return None
+    
+    # Run formation_tune_elasticnet to get hyperparameters
+    enet_start = time_module.time()
+    
+    try:
+        # The data is already prepared; now filter to approved features for ElasticNet
+        available_approved = [f for f in approved_features if f in feature_cols]
+        
+        if len(available_approved) == 0:
+            if verbose:
+                print("[warn] No approved features available for ElasticNet tuning")
+            return None
+        
+        # Filter X to only approved features
+        X_approved = X_formation[available_approved]
+        
+        # Compute time-decay weights for formation data
+        weights = compute_time_decay_weights(
+            dates_formation,
+            train_end=dates_formation.max(),
+            half_life=config.features.formation_halflife_days
+        )
+        
+        # Call formation_tune_elasticnet
+        best_alpha, best_l1_ratio, enet_diagnostics = formation_tune_elasticnet(
+            X=X_approved,
+            y=y_formation,
+            dates=dates_formation,
+            approved_features=available_approved,
+            weights=weights,
+            alpha_grid=config.features.alpha_grid,
+            l1_ratio_grid=config.features.l1_ratio_grid,
+            cv_folds=3,
+            n_jobs=4
+        )
+        
+        enet_elapsed = time_module.time() - enet_start
+        
+        if verbose:
+            print(f"[formation] ElasticNet tuning: alpha={best_alpha:.4f}, l1_ratio={best_l1_ratio:.2f} in {enet_elapsed:.2f}s")
+        
+    except Exception as e:
+        if verbose:
+            print(f"[error] formation_tune_elasticnet failed: {e}")
+            import traceback
+            traceback.print_exc()
+        return None
+    
+    # Package artifacts
+    formation_artifacts = {
+        'approved_features': approved_features,
+        'best_alpha': best_alpha,
+        'best_l1_ratio': best_l1_ratio,
+        'formation_diagnostics': {
+            'fdr_diagnostics': fdr_diagnostics,
+            'enet_diagnostics': enet_diagnostics,
+            'n_approved': len(approved_features),
+            't_formation_start': t_formation_start,
+            't_formation_end': t_formation_end,
+        }
+    }
+    
+    return formation_artifacts
 
 
 def apply_universe_filters(
@@ -239,7 +423,7 @@ def run_walk_forward_backtest(
              t_train_end = t0 - 1 - HOLDING_PERIOD_DAYS
     
     2. Train model on training window with feature selection:
-       model, diagnostics = per_window_pipeline(panel_train, metadata, t0, config)
+       model, diagnostics = train_window_model(panel_train, metadata, t0, config)
     
     3. Get eligible universe at t0
     
@@ -354,9 +538,34 @@ def run_walk_forward_backtest(
                 print(f"\n{'='*60}")
                 print(f"[{i+1}/{len(current_dates)}] Rebalance date: {t0.date()}")
             
-            # Define training window
-            t_train_start = t0 - pd.Timedelta(days=config.time.TRAINING_WINDOW_DAYS)
-            t_train_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
+            # Compute Formation artifacts (v3 pipeline)
+            formation_artifacts = None
+            
+            if hasattr(config.features, 'formation_years') and config.features.formation_years > 0:
+                # V3 PIPELINE: Use Formation/Training split
+                formation_artifacts = compute_formation_artifacts(
+                    panel_df=panel_df,
+                    universe_metadata=universe_metadata,
+                    t0=t0,
+                    config=config,
+                    verbose=False  # Suppress output in parallel mode
+                )
+                
+                if formation_artifacts is None:
+                    if verbose_inner:
+                        print("[skip] Formation artifacts computation failed")
+                    return None
+            
+            # Define Training window
+            if formation_artifacts is not None:
+                # V3: Training window is shorter (1 year by default)
+                training_days = int(config.features.training_years * 252)
+                t_train_start = t0 - pd.Timedelta(days=training_days)
+                t_train_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
+            else:
+                # V2: Use old TRAINING_WINDOW_DAYS config
+                t_train_start = t0 - pd.Timedelta(days=config.time.TRAINING_WINDOW_DAYS)
+                t_train_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
             
             if verbose_inner:
                 print(f"Training window: [{t_train_start.date()}, {t_train_end.date()}]")
@@ -366,9 +575,10 @@ def run_walk_forward_backtest(
                     print("[skip] Invalid training window")
                 return None
             
-            # Train model using per_window_pipeline
+            # Train model using train_window_model
             if verbose_inner:
-                print(f"[train] Training {model_type} model with feature selection...")
+                pipeline_version = "v3" if formation_artifacts else "v2"
+                print(f"[train] Training {model_type} model ({pipeline_version} pipeline)...")
             
             train_start = time.time()
             try:
@@ -379,12 +589,13 @@ def run_walk_forward_backtest(
                 )
                 panel_train = panel_df[train_mask]
                 
-                # Train model with feature selection (returns model + diagnostics)
-                model, all_diagnostics = per_window_pipeline(
+                # Train model with feature selection (v3 or v2 depending on formation_artifacts)
+                model, all_diagnostics = train_window_model(
                     panel=panel_train,
                     metadata=universe_metadata,
                     t0=t0,
-                    config=config
+                    config=config,
+                    formation_artifacts=formation_artifacts  # Pass artifacts for v3 pipeline
                 )
                 
                 # Extract diagnostics
@@ -392,8 +603,16 @@ def run_walk_forward_backtest(
                     'date': t0,
                     'n_features': len(model.selected_features) if model else 0,
                     'selected_features': model.selected_features if model else [],
+                    'pipeline_version': 'v3' if formation_artifacts else 'v2',
                     **all_diagnostics  # Include stage counts, timings, etc.
                 }
+                
+                # Add Formation diagnostics if available
+                if formation_artifacts and 'formation_diagnostics' in formation_artifacts:
+                    diagnostics_entry['formation_n_approved'] = formation_artifacts['formation_diagnostics']['n_approved']
+                    diagnostics_entry['formation_alpha'] = formation_artifacts['best_alpha']
+                    diagnostics_entry['formation_l1_ratio'] = formation_artifacts['best_l1_ratio']
+                
                 train_elapsed = time.time() - train_start
             except Exception as e:
                 if verbose_inner:
@@ -691,10 +910,40 @@ def run_walk_forward_backtest(
                 print(f"[{i+1}/{len(current_dates)}] Rebalance date: {t0.date()}")
             
             # =====================================================================
-            # 1. Define training window
+            # 1. Compute Formation artifacts (v3 pipeline)
             # =====================================================================
-            t_train_start = t0 - pd.Timedelta(days=config.time.TRAINING_WINDOW_DAYS)
-            t_train_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
+            formation_artifacts = None
+            
+            if hasattr(config.features, 'formation_years') and config.features.formation_years > 0:
+                # V3 PIPELINE: Use Formation/Training split
+                if verbose:
+                    print(f"[v3] Using Formation ({config.features.formation_years:.1f}yr) + Training ({config.features.training_years:.1f}yr) pipeline")
+                
+                formation_artifacts = compute_formation_artifacts(
+                    panel_df=panel_df,
+                    universe_metadata=universe_metadata,
+                    t0=t0,
+                    config=config,
+                    verbose=verbose
+                )
+                
+                if formation_artifacts is None:
+                    if verbose:
+                        print("[skip] Formation artifacts computation failed")
+                    continue
+            
+            # =====================================================================
+            # 2. Define Training window
+            # =====================================================================
+            if formation_artifacts is not None:
+                # V3: Training window is shorter (1 year by default)
+                training_days = int(config.features.training_years * 252)
+                t_train_start = t0 - pd.Timedelta(days=training_days)
+                t_train_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
+            else:
+                # V2: Use old TRAINING_WINDOW_DAYS config
+                t_train_start = t0 - pd.Timedelta(days=config.time.TRAINING_WINDOW_DAYS)
+                t_train_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
             
             if verbose:
                 print(f"Training window: [{t_train_start.date()}, {t_train_end.date()}]")
@@ -703,13 +952,14 @@ def run_walk_forward_backtest(
             if t_train_end <= t_train_start:
                 if verbose:
                     print("[skip] Invalid training window")
-                    continue
+                continue
             
             # =====================================================================
-            # 2. Train model with feature selection
+            # 3. Train model with feature selection
             # =====================================================================
             if verbose:
-                print(f"[train] Training {model_type} model with feature selection...")
+                pipeline_version = "v3" if formation_artifacts else "v2"
+                print(f"[train] Training {model_type} model ({pipeline_version} pipeline)...")
             
             train_start = time.time()
             try:
@@ -720,12 +970,13 @@ def run_walk_forward_backtest(
                 )
                 panel_train = panel_df[train_mask]
                 
-                # Train model with feature selection (returns model + diagnostics)
-                model, all_diagnostics = per_window_pipeline(
+                # Train model with feature selection (v3 or v2 depending on formation_artifacts)
+                model, all_diagnostics = train_window_model(
                     panel=panel_train,
                     metadata=universe_metadata,
                     t0=t0,
-                    config=config
+                    config=config,
+                    formation_artifacts=formation_artifacts  # Pass artifacts for v3 pipeline
                 )
                 
                 # Record diagnostics
@@ -733,14 +984,24 @@ def run_walk_forward_backtest(
                     'date': t0,
                     'n_features': len(model.selected_features) if model else 0,
                     'selected_features': model.selected_features if model else [],
+                    'pipeline_version': 'v3' if formation_artifacts else 'v2',
                     **all_diagnostics  # Include stage counts, timings, etc.
                 }
+                
+                # Add Formation diagnostics if available
+                if formation_artifacts and 'formation_diagnostics' in formation_artifacts:
+                    diagnostics_entry['formation_n_approved'] = formation_artifacts['formation_diagnostics']['n_approved']
+                    diagnostics_entry['formation_alpha'] = formation_artifacts['best_alpha']
+                    diagnostics_entry['formation_l1_ratio'] = formation_artifacts['best_l1_ratio']
+                
                 train_elapsed = time.time() - train_start
                 total_train_time += train_elapsed
                 
             except Exception as e:
                 if verbose:
                     print(f"[error] Model training failed: {e}")
+                    import traceback
+                    traceback.print_exc()
                 continue
             
             # =====================================================================
@@ -986,9 +1247,9 @@ def run_walk_forward_backtest(
         # Save summary diagnostics to CSV
         diag_summary = []
         for entry in diagnostics:
-            # Get top 5 features by |IC|
-            if entry['ic_values']:
-                ic_dict = entry['ic_values']
+            # Get top 5 features by |IC| (handle both v2 and v3 diagnostics format)
+            ic_dict = entry.get('ic_values', {})
+            if ic_dict:
                 abs_ic = {k: abs(v) for k, v in ic_dict.items() if pd.notna(v)}
                 top_features = sorted(abs_ic.items(), key=lambda x: x[1], reverse=True)[:5]
                 top_features_str = '; '.join([f"{k}={v:.3f}" for k, v in top_features])
@@ -996,9 +1257,9 @@ def run_walk_forward_backtest(
                 top_features_str = ""
             
             diag_summary.append({
-                'date': entry['date'],
-                'universe_size': entry['universe_size'],
-                'n_features': entry['n_features'],
+                'date': entry.get('date', ''),
+                'universe_size': entry.get('universe_size', 0),
+                'n_features': entry.get('n_features', entry.get('final_n_features', 0)),
                 'top_5_features': top_features_str
             })
         
@@ -1012,12 +1273,18 @@ def run_walk_forward_backtest(
             # Convert dates to strings for JSON serialization
             json_data = []
             for entry in diagnostics:
+                date_val = entry.get('date')
+                if hasattr(date_val, 'isoformat'):
+                    date_str = date_val.isoformat()
+                else:
+                    date_str = str(date_val) if date_val else ''
+                
                 json_entry = {
-                    'date': entry['date'].isoformat(),
-                    'universe_size': entry['universe_size'],
-                    'n_features': entry['n_features'],
-                    'selected_features': entry['selected_features'],
-                    'ic_values': entry['ic_values']
+                    'date': date_str,
+                    'universe_size': entry.get('universe_size', 0),
+                    'n_features': entry.get('n_features', entry.get('final_n_features', 0)),
+                    'selected_features': entry.get('selected_features', []),
+                    'ic_values': entry.get('ic_values', {})
                 }
                 json_data.append(json_entry)
             json.dump(json_data, f, indent=2)

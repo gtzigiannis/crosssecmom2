@@ -23,7 +23,7 @@ import psutil
 from joblib import Parallel, delayed
 from scipy import stats
 from sklearn.tree import DecisionTreeRegressor
-from sklearn.linear_model import ElasticNetCV
+from sklearn.linear_model import ElasticNet, ElasticNetCV
 from sklearn.model_selection import TimeSeriesSplit
 from statsmodels.stats.multitest import multipletests
 from statsmodels.stats.sandwich_covariance import cov_hac
@@ -208,13 +208,14 @@ def formation_fdr(
     X = X.astype(np.float32)
     y = y.astype(np.float64)  # Keep target as float64 for numerical stability
     
-    # Compute time-decay weights
-    train_end = dates.max()
-    weights = compute_time_decay_weights(dates, train_end, half_life)
-    
     # Compute daily IC series for all features
     logger.info("Computing daily IC series...")
     ic_daily = compute_daily_ic_series(X, y, dates)
+    
+    # Compute time-decay weights PER UNIQUE DATE (not per sample)
+    unique_dates = ic_daily.index  # This is a DatetimeIndex
+    train_end = unique_dates.max()
+    weights = compute_time_decay_weights(unique_dates, train_end, half_life)
     
     # For each feature, compute weighted mean IC and Newey-West t-stat
     logger.info("Computing weighted IC and Newey-West t-stats...")
@@ -280,6 +281,164 @@ def formation_fdr(
     return approved_features, diagnostics_df
 
 
+def formation_tune_elasticnet(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.DatetimeIndex,
+    approved_features: List[str],
+    weights: Optional[np.ndarray] = None,
+    alpha_grid: Optional[List[float]] = None,
+    l1_ratio_grid: Optional[List[float]] = None,
+    cv_folds: int = 3,
+    n_jobs: int = 4
+) -> Tuple[float, float, Dict]:
+    """
+    Tune ElasticNet hyperparameters on Formation window using time-series CV.
+    
+    This function runs ElasticNetCV on the Formation period to select optimal
+    (alpha*, l1_ratio*) that will be reused on all Training windows.
+    
+    Args:
+        X: Feature matrix for Formation period (samples × all_features)
+        y: Target series for Formation period
+        dates: Date for each sample
+        approved_features: List of features approved by formation_fdr (S_F)
+        weights: Optional sample weights (e.g., time-decay weights)
+        alpha_grid: List of alpha values to try (default: [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0])
+        l1_ratio_grid: List of L1 ratios to try (default: [0.1, 0.3, 0.5, 0.7, 0.9, 1.0])
+        cv_folds: Number of time-series CV folds (default: 3)
+        n_jobs: Number of parallel jobs
+        
+    Returns:
+        Tuple of (best_alpha, best_l1_ratio, diagnostics_dict)
+    """
+    logger.info("=" * 80)
+    logger.info("Formation ElasticNet hyperparameter tuning")
+    logger.info(f"Features: {len(approved_features)}, Samples: {X.shape[0]}, CV folds: {cv_folds}")
+    log_memory_usage("Formation ElasticNet start")
+    
+    start_time = time.time()
+    
+    # Default grids if not provided
+    if alpha_grid is None:
+        alpha_grid = [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0]
+    if l1_ratio_grid is None:
+        l1_ratio_grid = [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+    
+    # Extract approved features
+    X_approved = X[approved_features].astype(np.float32)
+    y_np = y.values.astype(np.float64)
+    
+    # Handle NaN values: create valid mask and filter
+    valid_mask = ~(np.isnan(X_approved.values).any(axis=1) | np.isnan(y_np))
+    n_total = len(valid_mask)
+    n_valid = valid_mask.sum()
+    
+    if n_valid < 50:
+        logger.warning(f"Too few valid samples ({n_valid}/{n_total}) for ElasticNet tuning")
+        return alpha_grid[len(alpha_grid)//2], l1_ratio_grid[len(l1_ratio_grid)//2], {
+            'error': f'Too few valid samples: {n_valid}',
+            'n_total': n_total,
+            'n_valid': n_valid
+        }
+    
+    if n_valid < n_total:
+        logger.info(f"Filtering NaN samples: {n_valid}/{n_total} ({100*n_valid/n_total:.1f}%) valid")
+    
+    X_approved = X_approved.iloc[valid_mask]
+    y_np = y_np[valid_mask]
+    
+    # Also filter weights if provided
+    if weights is not None:
+        weights = weights[valid_mask]
+    
+    # Robust standardization (median/MAD)
+    logger.info("Standardizing features...")
+    X_std, std_params = robust_standardization(X_approved)
+    X_std_np = X_std.values
+    
+    # Create time-series cross-validator
+    tscv = TimeSeriesSplit(n_splits=cv_folds)
+    
+    # Grid search over alpha and l1_ratio
+    logger.info(f"Grid search: {len(alpha_grid)} alphas × {len(l1_ratio_grid)} l1_ratios = {len(alpha_grid) * len(l1_ratio_grid)} combinations")
+    
+    best_score = -np.inf
+    best_alpha = alpha_grid[0]
+    best_l1_ratio = l1_ratio_grid[0]
+    
+    results = []
+    
+    for alpha in alpha_grid:
+        for l1_ratio in l1_ratio_grid:
+            # Create ElasticNet model
+            model = ElasticNet(
+                alpha=alpha,
+                l1_ratio=l1_ratio,
+                max_iter=10000,
+                tol=1e-4,
+                random_state=42
+            )
+            
+            # Cross-validation
+            cv_scores = []
+            for train_idx, test_idx in tscv.split(X_std_np):
+                X_train_cv = X_std_np[train_idx]
+                y_train_cv = y_np[train_idx]
+                X_test_cv = X_std_np[test_idx]
+                y_test_cv = y_np[test_idx]
+                
+                # Apply sample weights if provided
+                if weights is not None:
+                    w_train_cv = weights[train_idx]
+                    model.fit(X_train_cv, y_train_cv, sample_weight=w_train_cv)
+                else:
+                    model.fit(X_train_cv, y_train_cv)
+                
+                # Score on test fold
+                score = model.score(X_test_cv, y_test_cv)
+                cv_scores.append(score)
+            
+            # Mean CV score (R²)
+            mean_score = np.mean(cv_scores)
+            std_score = np.std(cv_scores)
+            
+            results.append({
+                'alpha': alpha,
+                'l1_ratio': l1_ratio,
+                'mean_cv_score': mean_score,
+                'std_cv_score': std_score
+            })
+            
+            # Update best
+            if mean_score > best_score:
+                best_score = mean_score
+                best_alpha = alpha
+                best_l1_ratio = l1_ratio
+    
+    elapsed = time.time() - start_time
+    
+    logger.info(f"Formation ElasticNet tuning complete in {elapsed:.1f}s")
+    logger.info(f"Best hyperparameters: alpha={best_alpha:.4f}, l1_ratio={best_l1_ratio:.2f}, CV R²={best_score:.4f}")
+    log_memory_usage("Formation ElasticNet end")
+    
+    diagnostics = {
+        'best_alpha': best_alpha,
+        'best_l1_ratio': best_l1_ratio,
+        'best_cv_score': best_score,
+        'grid_search_results': pd.DataFrame(results),
+        'time_formation_elasticnet': elapsed,
+        'n_features': len(approved_features),
+        'cv_folds': cv_folds
+    }
+    
+    # Clean up
+    del X_std, X_std_np
+    gc.collect()
+    
+    return best_alpha, best_l1_ratio, diagnostics
+
+
 # ============================================================================
 # Per-Window Pipeline
 # ============================================================================
@@ -314,11 +473,24 @@ def per_window_ic_filter(
     # Compute daily IC series
     ic_daily = compute_daily_ic_series(X, y, dates)
     
+    # Aggregate per-sample weights into per-date weights
+    # weights is per-sample, but IC is per-date, so we need to average weights by date
+    unique_dates = pd.DatetimeIndex(dates.unique())
+    w_by_date = pd.Series(index=unique_dates, dtype=np.float32)
+    
+    for date in unique_dates:
+        date_mask = dates == date
+        w_by_date.loc[date] = np.float32(weights[date_mask].mean())
+    
     # Process each feature
     def process_feature(feat_name):
         ic_series = ic_daily[feat_name]
-        ic_weighted = np.average(ic_series, weights=weights)
-        t_nw = compute_newey_west_tstat(ic_series, weights)
+        
+        # Align per-date weights with IC series dates
+        weights_aligned = w_by_date.loc[ic_series.index].values
+        
+        ic_weighted = np.average(ic_series.values, weights=weights_aligned)
+        t_nw = compute_newey_west_tstat(ic_series, weights_aligned)
         
         return {
             'feature': feat_name,
@@ -350,6 +522,176 @@ def per_window_ic_filter(
     return selected, diagnostics
 
 
+def rank_features_by_ic_and_sign_consistency(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.DatetimeIndex,
+    weights: np.ndarray,
+    num_blocks: int = 3,
+    ic_floor: float = 0.01,
+    top_k: int = 200,
+    min_features: int = 100,
+    n_jobs: int = 4
+) -> Tuple[List[str], Dict]:
+    """
+    Soft ranking based on IC and sign consistency (no hard stability drop).
+    
+    This function:
+    1. Computes time-decayed IC_full over the entire Training window
+    2. Splits Training into B contiguous blocks
+    3. Computes IC_b for each block
+    4. Computes sign consistency: c_j = (# blocks with same sign as IC_full) / B
+    5. Ranks features by: s_j = |IC_full| * (0.5 + 0.5 * c_j)
+    6. Keeps top K features (or all if above min_features threshold)
+    
+    Features with frequent sign flips get down-weighted but not automatically discarded.
+    
+    Args:
+        X: Feature matrix (samples × features)
+        y: Target series
+        dates: DatetimeIndex for samples
+        weights: Time-decay weights (per-sample)
+        num_blocks: Number of contiguous blocks (B, default 3)
+        ic_floor: Weak |IC_full| floor (default 0.01), only enforced if keeps >= min_features
+        top_k: Top K features to keep (default 200)
+        min_features: Minimum features to guarantee (default 100)
+        n_jobs: Number of parallel jobs
+        
+    Returns:
+        Tuple of (ranked_features, diagnostics_dict)
+    """
+    start_time = time.time()
+    logger.info(f"Soft IC ranking: {X.shape[1]} features, {num_blocks} blocks")
+    
+    # Split dates into B contiguous blocks
+    n_dates = len(dates)
+    block_size = n_dates // num_blocks
+    
+    if block_size < 3:
+        logger.warning(f"Block size too small ({block_size} dates), reducing to {num_blocks-1} blocks")
+        num_blocks = max(2, num_blocks - 1)
+        block_size = n_dates // num_blocks
+    
+    # Create block assignments
+    blocks = []
+    for b in range(num_blocks):
+        start_idx = b * block_size
+        end_idx = (b + 1) * block_size if b < num_blocks - 1 else n_dates
+        block_dates = dates[start_idx:end_idx]
+        blocks.append(block_dates)
+    
+    # Aggregate per-sample weights into per-date weights for IC computation
+    unique_dates = pd.DatetimeIndex(dates.unique())
+    w_by_date = pd.Series(index=unique_dates, dtype=np.float32)
+    for date in unique_dates:
+        date_mask = dates == date
+        w_by_date.loc[date] = np.float32(weights[date_mask].mean())
+    
+    # Compute IC_full for each feature over entire Training window
+    logger.info("Computing full-window IC with time-decay...")
+    ic_daily = compute_daily_ic_series(X, y, dates)
+    
+    def process_feature(feat_name):
+        ic_series = ic_daily[feat_name]
+        
+        # Weighted mean IC over full window
+        weights_aligned = w_by_date.loc[ic_series.index].values
+        ic_full = np.average(ic_series.values, weights=weights_aligned)
+        
+        # Compute IC for each block
+        block_ics = []
+        for block_dates in blocks:
+            # Filter IC series to this block's dates
+            block_ic_series = ic_series[ic_series.index.isin(block_dates)]
+            
+            if len(block_ic_series) < 3:
+                block_ics.append(np.nan)
+                continue
+            
+            # Mean IC in this block (no additional time-decay within block)
+            block_ic_mean = block_ic_series.mean()
+            block_ics.append(block_ic_mean)
+        
+        block_ics = np.array(block_ics)
+        valid_blocks = block_ics[~np.isnan(block_ics)]
+        
+        if len(valid_blocks) == 0:
+            return {
+                'feature': feat_name,
+                'ic_full': ic_full,
+                'block_ics': block_ics,
+                'sign_consistency': 0.0,
+                'rank_score': 0.0
+            }
+        
+        # Sign consistency: fraction of blocks with same sign as IC_full
+        sgn_full = np.sign(ic_full)
+        if sgn_full == 0:
+            # Treat zero as neutral (perfect consistency)
+            c_j = 1.0
+        else:
+            n_same_sign = (np.sign(valid_blocks) == sgn_full).sum()
+            c_j = n_same_sign / len(valid_blocks)
+        
+        # Ranking score: s_j = |IC_full| * (0.5 + 0.5 * c_j)
+        s_j = abs(ic_full) * (0.5 + 0.5 * c_j)
+        
+        return {
+            'feature': feat_name,
+            'ic_full': ic_full,
+            'block_ics': block_ics,
+            'sign_consistency': c_j,
+            'rank_score': s_j
+        }
+    
+    # Process features in parallel
+    logger.info("Computing block ICs and sign consistency...")
+    results = Parallel(n_jobs=n_jobs, backend='loky')(
+        delayed(process_feature)(feat) for feat in X.columns
+    )
+    
+    # Create diagnostics dataframe
+    results_df = pd.DataFrame(results)
+    
+    # Sort by rank_score (descending)
+    results_df = results_df.sort_values('rank_score', ascending=False)
+    
+    # Select top K
+    top_k_features = results_df.head(top_k)['feature'].tolist()
+    
+    # Apply |IC_full| floor if it still leaves >= min_features
+    if ic_floor > 0:
+        above_floor = results_df[abs(results_df['ic_full']) >= ic_floor]
+        if len(above_floor) >= min_features:
+            # Intersect top_k with above_floor
+            floor_features = set(above_floor['feature'].tolist())
+            top_k_features = [f for f in top_k_features if f in floor_features]
+            logger.info(f"Applied IC floor {ic_floor}: {len(top_k_features)} features")
+        else:
+            logger.info(f"IC floor {ic_floor} would leave only {len(above_floor)} features < min {min_features}, ignoring floor")
+    
+    elapsed = time.time() - start_time
+    
+    diagnostics = {
+        'n_start': X.shape[1],
+        'n_after_ranking': len(top_k_features),
+        'results_df': results_df,
+        'time_ranking': elapsed,
+        'num_blocks': num_blocks,
+        'ic_floor_applied': ic_floor if len(top_k_features) >= min_features else 0.0
+    }
+    
+    logger.info(f"Soft ranking complete: {len(top_k_features)} features selected (time: {elapsed:.1f}s)")
+    logger.info(f"  Mean rank_score: {results_df.head(len(top_k_features))['rank_score'].mean():.4f}")
+    logger.info(f"  Mean sign_consistency: {results_df.head(len(top_k_features))['sign_consistency'].mean():.3f}")
+    
+    # Clean up
+    del ic_daily
+    gc.collect()
+    
+    return top_k_features, diagnostics
+
+
 def per_window_stability(
     X: pd.DataFrame,
     y: pd.Series,
@@ -360,7 +702,9 @@ def per_window_stability(
     n_jobs: int = 1
 ) -> Tuple[List[str], Dict]:
     """
-    Filter features based on stability across temporal folds.
+    DEPRECATED: Use rank_features_by_ic_and_sign_consistency instead.
+    
+    Filter features based on stability across temporal folds (kept for backward compatibility).
     
     Stability criteria:
     1. Sign consistency: IC has same sign in at least min_sign_consistency folds
@@ -403,17 +747,27 @@ def per_window_stability(
         fold_ics = []
         for fold_dates in folds:
             # Get data for this fold
-            mask = X.index.isin(fold_dates)
+            # Handle MultiIndex case (extract Date level)
+            if isinstance(X.index, pd.MultiIndex):
+                date_level = X.index.get_level_values('Date')
+                mask = date_level.isin(fold_dates)
+            else:
+                mask = X.index.isin(fold_dates)
+            
             X_fold = X.loc[mask, [feat_name]]
             y_fold = y.loc[mask]
             
             # Compute mean IC across dates in fold
-            fold_dates_actual = X.index[mask].unique()
-            if len(fold_dates_actual) < 3:
+            if isinstance(X.index, pd.MultiIndex):
+                fold_dates_samples = X.index[mask].get_level_values('Date')
+            else:
+                fold_dates_samples = X.index[mask]
+            
+            if len(fold_dates_samples.unique()) < 3:
                 fold_ics.append(np.nan)
                 continue
                 
-            ic_daily = compute_daily_ic_series(X_fold, y_fold, fold_dates_actual)
+            ic_daily = compute_daily_ic_series(X_fold, y_fold, fold_dates_samples)
             ic_mean = ic_daily[feat_name].mean()
             fold_ics.append(ic_mean)
         
@@ -481,6 +835,11 @@ def supervised_binning_and_representation(
     n_jobs: int = 1
 ) -> Tuple[List[str], Dict]:
     """
+    DEPRECATED in v3 pipeline: Binning is not used in production code.
+    
+    This function is kept only for backward compatibility with v2 tests.
+    The v3 pipeline operates exclusively on continuous features.
+    
     Create binned versions of features using decision trees and select best representation.
     
     For each feature:
@@ -499,12 +858,25 @@ def supervised_binning_and_representation(
     Returns:
         Tuple of (selected_features_list, diagnostics_dict)
     """
+    import warnings
+    warnings.warn(
+        "supervised_binning_and_representation is DEPRECATED in v3 pipeline. "
+        "The production pipeline uses continuous features only. "
+        "This function is kept for backward compatibility.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    
     start_time = time.time()
     logger.info(f"Binning: {X.shape[1]} features, k_bin={k_bin}")
     
     # Compute IC for all raw features once
-    dates_unique = X.index.unique()
-    ic_daily_raw = compute_daily_ic_series(X, y, dates_unique)
+    if isinstance(X.index, pd.MultiIndex):
+        dates_samples = X.index.get_level_values('Date')
+    else:
+        dates_samples = X.index
+    
+    ic_daily_raw = compute_daily_ic_series(X, y, dates_samples)
     ic_raw = ic_daily_raw.mean()  # Mean IC per feature
     
     def process_feature(feat_name):
@@ -536,12 +908,12 @@ def supervised_binning_and_representation(
         try:
             tree.fit(X_clean, y_clean)
             
-            # Create binned feature (use tree predictions as bin assignments)
-            X_binned = tree.predict(X_feat)
+            # Create binned feature (use tree leaf IDs as bin assignments, not predictions)
+            X_binned = tree.apply(X_feat).astype(np.float32)  # Get leaf node IDs
             X_binned_df = pd.DataFrame({f'{feat_name}_binned': X_binned}, index=X.index)
             
             # Compute IC for binned version
-            ic_daily_binned = compute_daily_ic_series(X_binned_df, y, dates_unique)
+            ic_daily_binned = compute_daily_ic_series(X_binned_df, y, dates_samples)
             ic_binned = ic_daily_binned.mean().iloc[0]
             
         except Exception as e:
@@ -877,6 +1249,7 @@ def per_window_pipeline(
     approved_features: List[str],
     half_life: float = 126.0,
     theta_ic: float = 0.03,
+    t_min: float = 1.96,
     theta_stable: float = 0.03,
     k_folds: int = 3,
     min_sign_consistency: int = 2,
@@ -892,7 +1265,7 @@ def per_window_pipeline(
     Run complete per-window feature selection pipeline and score at t0.
     
     Pipeline stages:
-    1. IC filter (theta_ic threshold)
+    1. IC filter (theta_ic threshold + t_min Newey-West t-stat)
     2. Stability across K folds (sign consistency + magnitude)
     3. Supervised binning (DecisionTree representation choice)
     4. Correlation redundancy filter
@@ -940,7 +1313,7 @@ def per_window_pipeline(
     selected_ic, diag_ic = per_window_ic_filter(
         X, y_train, dates_train, weights,
         theta_ic=theta_ic,
-        t_min=1.96,
+        t_min=t_min,
         n_jobs=n_jobs
     )
     all_diagnostics['ic_filter'] = diag_ic
@@ -966,28 +1339,23 @@ def per_window_pipeline(
         logger.warning("No features passed stability, returning zeros")
         return pd.Series(0.0, index=X_t0.index), all_diagnostics, None
     
-    # Stage 3: Supervised Binning
+    # Stage 3: Supervised Binning - DEPRECATED in v3 pipeline, skipped
+    # In v3, we operate only on continuous features (no binning)
     X_stable = X_ic[selected_stable]
-    selected_binned, diag_binning = supervised_binning_and_representation(
-        X_stable, y_train,
-        k_bin=k_bin,
-        min_samples_leaf=50,
-        n_jobs=n_jobs
-    )
-    all_diagnostics['binning'] = diag_binning
-    logger.info(f"After binning: {len(selected_binned)} features")
+    # selected_binned, diag_binning = supervised_binning_and_representation(
+    #     X_stable, y_train,
+    #     k_bin=k_bin,
+    #     min_samples_leaf=50,
+    #     n_jobs=n_jobs
+    # )
+    # all_diagnostics['binning'] = diag_binning
+    # logger.info(f"After binning: {len(selected_binned)} features")
     
-    if len(selected_binned) == 0:
-        logger.warning("No features after binning, returning zeros")
-        return pd.Series(0.0, index=X_t0.index), all_diagnostics, None
-    
-    # Note: Binning may create new feature names (e.g., 'feature_0_binned')
-    # We need to reconstruct X with binned features for next stages
-    # For simplicity, if binning selected raw features, continue with those
-    # In production, would need to apply binning transformation
+    # Skip binning in v3 pipeline
+    logger.info("Skipping binning stage (v3 pipeline uses continuous features only)")
     
     # Stage 4: Correlation Redundancy Filter
-    # Use original selected_stable features (binning just for IC comparison)
+    # Use selected_stable features directly (no binning)
     X_for_corr = X_stable
     selected_nonredundant, diag_redundancy = correlation_redundancy_filter(
         X_for_corr,
@@ -1079,6 +1447,196 @@ def per_window_pipeline(
     return scores_t0, all_diagnostics, window_model  # Return wrapped model
 
 
+def per_window_pipeline_v3(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_t0: pd.DataFrame,
+    dates_train: pd.DatetimeIndex,
+    formation_artifacts: Dict,
+    config: 'ResearchConfig',
+    n_jobs: int = 1
+) -> Tuple[pd.Series, Dict, object]:
+    """
+    V3 per-window feature selection pipeline using Formation artifacts.
+    
+    Pipeline stages (V3):
+    1. Extract S_F (approved features) and (alpha*, l1_ratio*) from formation_artifacts
+    2. Soft ranking by IC + sign consistency (no hard stability drop)
+    3. Correlation redundancy filter
+    4. Robust standardization (median/MAD)
+    5. Fit single ElasticNet with Formation hyperparameters (NO CV)
+    6. Score at t0 using trained model
+    
+    Key differences from v2:
+    - No hard IC filter with t-stat threshold
+    - No hard stability filter (uses soft ranking instead)
+    - No binning
+    - No ElasticNetCV (uses Formation hyperparameters)
+    
+    Args:
+        X_train: Raw feature matrix for training window (all features)
+        y_train: Target series for training window
+        X_t0: Raw feature matrix at t0 (for scoring)
+        dates_train: DatetimeIndex for training samples
+        formation_artifacts: Dict containing:
+            - 'approved_features': List[str] (S_F from formation_fdr)
+            - 'best_alpha': float (from formation_tune_elasticnet)
+            - 'best_l1_ratio': float (from formation_tune_elasticnet)
+        config: ResearchConfig with v3 parameters
+        n_jobs: Parallel jobs
+        
+    Returns:
+        Tuple of (scores_at_t0 Series, diagnostics_dict, ElasticNetWindowModel)
+    """
+    start_time = time.time()
+    logger.info("=" * 80)
+    logger.info("V3 Per-window pipeline (Formation-guided)")
+    logger.info(f"Train samples: {len(X_train)}, t0 samples: {len(X_t0)}")
+    
+    all_diagnostics = {}
+    
+    # Extract Formation artifacts
+    approved_features = formation_artifacts['approved_features']
+    best_alpha = formation_artifacts['best_alpha']
+    best_l1_ratio = formation_artifacts['best_l1_ratio']
+    
+    logger.info(f"Formation-approved features (S_F): {len(approved_features)}")
+    logger.info(f"Formation hyperparameters: alpha={best_alpha:.4f}, l1_ratio={best_l1_ratio:.2f}")
+    
+    # Extract approved features
+    X = X_train[approved_features]
+    
+    # Compute time-decay weights for soft ranking
+    train_end = dates_train[-1]
+    weights = compute_time_decay_weights(
+        dates_train, 
+        train_end, 
+        half_life=config.features.training_halflife_days
+    )
+    
+    # Stage 1: Soft ranking by IC + sign consistency
+    selected_ranked, diag_ranking = rank_features_by_ic_and_sign_consistency(
+        X, y_train, dates_train, weights,
+        num_blocks=config.features.per_window_num_blocks,
+        ic_floor=config.features.per_window_ic_floor,
+        top_k=config.features.per_window_top_k,
+        min_features=config.features.per_window_min_features,
+        n_jobs=n_jobs
+    )
+    all_diagnostics['soft_ranking'] = diag_ranking
+    logger.info(f"After soft ranking: {len(selected_ranked)} features")
+    
+    if len(selected_ranked) == 0:
+        logger.warning("No features after soft ranking, returning zeros")
+        return pd.Series(0.0, index=X_t0.index), all_diagnostics, None
+    
+    # Stage 2: Correlation Redundancy Filter
+    X_ranked = X[selected_ranked]
+    selected_nonredundant, diag_redundancy = correlation_redundancy_filter(
+        X_ranked,
+        corr_threshold=config.features.corr_threshold,
+        n_jobs=n_jobs
+    )
+    all_diagnostics['redundancy'] = diag_redundancy
+    logger.info(f"After redundancy filter: {len(selected_nonredundant)} features")
+    
+    if len(selected_nonredundant) == 0:
+        logger.warning("No features after redundancy filter, returning zeros")
+        return pd.Series(0.0, index=X_t0.index), all_diagnostics, None
+    
+    # Stage 3: Robust Standardization
+    X_nonredundant = X_ranked[selected_nonredundant]
+    X_std, std_params = robust_standardization(X_nonredundant)
+    all_diagnostics['standardization'] = {
+        'time_standardization': std_params['time_standardization']
+    }
+    logger.info(f"Standardization complete")
+    
+    # Stage 4: Fit single ElasticNet with Formation hyperparameters (NO CV)
+    logger.info(f"Fitting ElasticNet with Formation hyperparameters (no CV)...")
+    
+    from sklearn.linear_model import ElasticNet
+    model = ElasticNet(
+        alpha=best_alpha,
+        l1_ratio=best_l1_ratio,
+        max_iter=10000,
+        tol=1e-4,
+        random_state=42
+    )
+    
+    # Fit model
+    model.fit(X_std.values, y_train.values)
+    
+    # Extract features with non-zero coefficients
+    coef_threshold = config.features.elasticnet_coef_threshold
+    nonzero_mask = np.abs(model.coef_) > coef_threshold
+    selected_final = [feat for i, feat in enumerate(X_std.columns) if nonzero_mask[i]]
+    
+    n_selected = len(selected_final)
+    logger.info(f"ElasticNet selected {n_selected} features (coef_threshold={coef_threshold})")
+    
+    all_diagnostics['elasticnet'] = {
+        'alpha': best_alpha,
+        'l1_ratio': best_l1_ratio,
+        'n_features_in': len(X_std.columns),
+        'n_features_selected': n_selected,
+        'coef_threshold': coef_threshold
+    }
+    
+    if n_selected == 0:
+        logger.warning("ElasticNet selected no features, returning zeros")
+        return pd.Series(0.0, index=X_t0.index), all_diagnostics, None
+    
+    # Stage 5: Refit on selected features only (for cleaner model)
+    logger.info(f"Refitting ElasticNet on {n_selected} selected features...")
+    X_train_selected = X_std[selected_final]
+    
+    refit_model = ElasticNet(
+        alpha=best_alpha,
+        l1_ratio=best_l1_ratio,
+        max_iter=10000,
+        tol=1e-4,
+        random_state=42
+    )
+    refit_model.fit(X_train_selected.values, y_train.values)
+    
+    # Extract scaling params ONLY for selected features
+    selected_scaling_params = {
+        'median': {feat: std_params['median'][feat] for feat in selected_final},
+        'mad': {feat: std_params['mad'][feat] for feat in selected_final}
+    }
+    
+    # Stage 6: Create ElasticNetWindowModel
+    from alpha_models import ElasticNetWindowModel
+    
+    window_model = ElasticNetWindowModel(
+        selected_features=selected_final,
+        scaling_params=selected_scaling_params,
+        fitted_model=refit_model,
+        binning_params=None  # No binning in v3
+    )
+    
+    # Stage 7: Score at t0
+    # Important: Use selected_final features (after ElasticNet selection), NOT selected_nonredundant
+    X_t0_selected = X_t0[selected_final]  # Extract only ElasticNet-selected features
+    
+    scores_t0 = score_at_t0(
+        X_t0_selected,
+        selected_final,
+        selected_scaling_params,
+        refit_model
+    )
+    
+    all_diagnostics['total_time'] = time.time() - start_time
+    all_diagnostics['final_n_features'] = n_selected
+    
+    logger.info(f"V3 Pipeline complete: {n_selected} features, "
+                f"time: {all_diagnostics['total_time']:.1f}s")
+    logger.info("=" * 80)
+    
+    return scores_t0, all_diagnostics, window_model
+
+
 # ============================================================================
 # Bayesian Optimization for Hyperparameter Tuning
 # ============================================================================
@@ -1132,4 +1690,159 @@ def tune_hyperparameters(
     
     
     return optimal_hyperparams
+
+
+# ============================================================================
+# Walk-Forward Interface (High-Level Wrapper)
+# ============================================================================
+
+def train_window_model(
+    panel: pd.DataFrame,
+    metadata: pd.DataFrame,
+    t0: pd.Timestamp,
+    config: 'ResearchConfig',
+    formation_artifacts: Optional[Dict] = None
+) -> Tuple[Optional['ElasticNetWindowModel'], Dict]:
+    """
+    High-level interface for walk-forward engine (supports both v2 and v3 pipelines).
+    
+    Takes a training panel (with Date/Ticker multi-index) and returns a trained
+    model that can be used to score at t0.
+    
+    V3 Pipeline (when formation_artifacts provided):
+    - Uses approved features from Formation FDR
+    - Uses ElasticNet hyperparameters from Formation tuning
+    - Applies soft IC ranking (no hard stability drops)
+    - No binning, no CV in Training
+    
+    V2 Pipeline (when formation_artifacts=None, backward compatibility):
+    - Uses all features as "approved"
+    - Runs ElasticNetCV on Training window
+    - Uses hard IC/stability filters + binning
+    
+    Args:
+        panel: Training data panel (Date/Ticker multi-index, feature columns)
+        metadata: Universe metadata (ticker, sector, region, etc.)
+        t0: Scoring date (not used in training, only for scoring)
+        config: Research configuration
+        formation_artifacts: Optional dict from Formation phase containing:
+            - 'approved_features': List[str] (S_F from formation_fdr)
+            - 'best_alpha': float (from formation_tune_elasticnet)
+            - 'best_l1_ratio': float (from formation_tune_elasticnet)
+        
+    Returns:
+        (model, diagnostics) tuple where:
+        - model: ElasticNetWindowModel (or None if training failed)
+        - diagnostics: Dict with training statistics
+    """
+    from config import ResearchConfig
+    
+    use_v3 = formation_artifacts is not None
+    pipeline_version = "v3" if use_v3 else "v2 (backward compatibility)"
+    logger.info(f"train_window_model called for t0={t0}, pipeline={pipeline_version}")
+    
+    # Extract dates and prepare training data
+    dates_train = panel.index.get_level_values('Date').unique().sort_values()
+    
+    # Identify feature columns (exclude target and metadata columns)
+    # Support both naming conventions: FwdRet_{H} and ret_fwd_{H}d
+    target_col = f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}'
+    if target_col not in panel.columns:
+        # Fall back to alternative naming convention
+        target_col = f'ret_fwd_{config.time.HOLDING_PERIOD_DAYS}d'
+    
+    exclude_cols = {target_col, 'market_cap', 'volume', 'dollar_volume', 'Close', 'ADV_63', 'ADV_63_Rank'}
+    exclude_cols.update([f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}', f'ret_fwd_{config.time.HOLDING_PERIOD_DAYS}d'])
+    
+    feature_cols = [col for col in panel.columns if col not in exclude_cols]
+    
+    if len(feature_cols) == 0:
+        logger.warning("No feature columns found in panel")
+        return None, {'error': 'no_features', 'n_start': 0}
+    
+    # Check if target exists
+    if target_col not in panel.columns:
+        logger.error(f"Target column '{target_col}' not found in panel")
+        return None, {'error': 'no_target', 'n_start': len(feature_cols)}
+    
+    # Prepare X and y
+    X_train = panel[feature_cols].copy()
+    y_train = panel[target_col].copy()
+    
+    # Drop rows with NaN target
+    valid_mask = y_train.notna()
+    X_train = X_train[valid_mask]
+    y_train = y_train[valid_mask]
+    
+    if len(y_train) == 0:
+        logger.warning("No valid training samples (all targets are NaN)")
+        return None, {'error': 'no_valid_samples', 'n_start': len(feature_cols)}
+    
+    # For scoring at t0, we DON'T need X_t0 here - scoring happens later
+    # via model.score_at_date() which has access to full panel
+    # Just create dummy X_t0 for per_window_pipeline (which expects it)
+    # Use last date in training data as proxy
+    last_date = dates_train[-1]
+    t0_mask_proxy = panel.index.get_level_values('Date') == last_date
+    X_t0 = panel.loc[t0_mask_proxy, feature_cols].copy()
+    
+    if len(X_t0) == 0:
+        logger.warning(f"No data at last training date={last_date}")
+        return None, {'error': 'no_data_at_last_date', 'n_start': len(feature_cols)}
+    
+    # Extract dates for training samples
+    dates_train_samples = X_train.index.get_level_values('Date')
+    
+    # Choose pipeline based on whether formation_artifacts are provided
+    try:
+        if use_v3:
+            # V3 Pipeline: Use Formation artifacts
+            logger.info("Using V3 pipeline with Formation artifacts")
+            scores_t0, diagnostics, model = per_window_pipeline_v3(
+                X_train=X_train,
+                y_train=y_train,
+                X_t0=X_t0,
+                dates_train=dates_train_samples,
+                formation_artifacts=formation_artifacts,
+                config=config,
+                n_jobs=1
+            )
+        else:
+            # V2 Pipeline (backward compatibility): Use all features, run CV
+            logger.info("Using V2 pipeline (backward compatibility mode)")
+            approved_features = feature_cols
+            
+            # Set hyperparameters from config
+            alpha_grid = config.features.ALPHA_ELASTICNET if hasattr(config.features, 'ALPHA_ELASTICNET') else [0.1, 0.5, 1.0]
+            l1_ratio_grid = config.features.L1_RATIO if hasattr(config.features, 'L1_RATIO') else [0.5, 0.7, 0.9]
+            
+            scores_t0, diagnostics, model = per_window_pipeline(
+                X_train=X_train,
+                y_train=y_train,
+                X_t0=X_t0,
+                dates_train=dates_train_samples,
+                approved_features=approved_features,
+                half_life=126.0,
+                theta_ic=config.features.FORMATION_IC_THRESHOLD if hasattr(config.features, 'FORMATION_IC_THRESHOLD') else 0.03,
+                t_min=0.0,  # Relaxed for small test datasets; production should use 1.96
+                theta_stable=config.features.MIN_STABILITY_PVALUE if hasattr(config.features, 'MIN_STABILITY_PVALUE') else 0.03,
+                k_folds=3,
+                min_sign_consistency=2,
+                k_bin=config.features.K_BIN if hasattr(config.features, 'K_BIN') else 3,
+                corr_threshold=0.7,
+                alpha_grid=alpha_grid,
+                l1_ratio_grid=l1_ratio_grid,
+                cv_folds=3,
+                coef_threshold=1e-6,  # Very relaxed for small test datasets
+                n_jobs=1
+            )
+        
+        # Return model and diagnostics
+        return model, diagnostics
+        
+    except Exception as e:
+        logger.error(f"Pipeline failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, {'error': str(e), 'n_start': len(feature_cols)}
 

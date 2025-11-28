@@ -1240,133 +1240,7 @@ class TestScoreAtT0:
         assert isinstance(scores, pd.Series)
 
 
-class TestSupervisedBinning:
-    """Test supervised binning and representation selection."""
-    
-    def test_supervised_binning_basic(self, synthetic_single_window):
-        """Test basic functionality and output schema."""
-        from feature_selection import supervised_binning_and_representation
-        
-        X_df, y_series = synthetic_single_window
-        
-        # Select subset of features for binning
-        features_in = list(X_df.columns[:5])
-        X_subset = X_df[features_in]
-        
-        selected, diag = supervised_binning_and_representation(
-            X_subset, y_series,
-            k_bin=3,
-            min_samples_leaf=20,
-            n_jobs=1
-        )
-        
-        # Should return list and diagnostics
-        assert isinstance(selected, list)
-        assert isinstance(diag, dict)
-        
-        # Diagnostics should have required keys
-        assert 'n_start' in diag
-        assert 'n_raw_selected' in diag
-        assert 'n_binned_selected' in diag
-        assert 'n_total_selected' in diag
-        assert 'time_binning' in diag
-        
-        # Should select at least some features
-        assert diag['n_total_selected'] > 0
-        assert len(selected) == diag['n_total_selected']
-        
-    def test_supervised_binning_representation_choice(self, synthetic_single_window):
-        """Test that binning improves IC for non-linear relationships."""
-        from feature_selection import supervised_binning_and_representation
-        
-        X_df, y_series = synthetic_single_window
-        np.random.seed(789)
-        
-        # Create a feature with non-linear relationship (U-shaped)
-        X_nonlinear = X_df.iloc[:, 0].values
-        y_nonlinear = (X_nonlinear ** 2) + 0.1 * np.random.randn(len(X_nonlinear))
-        y_nonlinear_series = pd.Series(y_nonlinear, index=X_df.index)
-        
-        # Add some linear features too
-        X_test = X_df.iloc[:, :3].copy()
-        
-        selected, diag = supervised_binning_and_representation(
-            X_test, y_nonlinear_series,
-            k_bin=3,
-            min_samples_leaf=20,
-            n_jobs=1
-        )
-        
-        # Should select binned version for non-linear feature
-        # (binning should capture U-shape better than raw)
-        assert diag['n_binned_selected'] > 0
-        
-        # Total selected should be sum of raw and binned
-        assert diag['n_total_selected'] == diag['n_raw_selected'] + diag['n_binned_selected']
-        
-    def test_supervised_binning_tree_depth(self, synthetic_single_window):
-        """Test that k_bin parameter controls tree depth."""
-        from feature_selection import supervised_binning_and_representation
-        
-        X_df, y_series = synthetic_single_window
-        X_subset = X_df.iloc[:, :5]
-        
-        # Shallow tree (k_bin=2) should create simpler bins
-        selected_shallow, diag_shallow = supervised_binning_and_representation(
-            X_subset, y_series,
-            k_bin=2,
-            min_samples_leaf=20,
-            n_jobs=1
-        )
-        
-        # Deeper tree (k_bin=5) should create more complex bins
-        selected_deep, diag_deep = supervised_binning_and_representation(
-            X_subset, y_series,
-            k_bin=5,
-            min_samples_leaf=20,
-            n_jobs=1
-        )
-        
-        # Both should return valid results
-        assert len(selected_shallow) > 0
-        assert len(selected_deep) > 0
-        
-    def test_supervised_binning_parallel(self, synthetic_single_window):
-        """Test parallel processing produces same results as serial."""
-        from feature_selection import supervised_binning_and_representation
-        
-        X_df, y_series = synthetic_single_window
-        X_subset = X_df.iloc[:, :5]
-        
-        np.random.seed(654)
-        selected_serial, _ = supervised_binning_and_representation(
-            X_subset, y_series, k_bin=3, n_jobs=1
-        )
-        
-        np.random.seed(654)
-        selected_parallel, _ = supervised_binning_and_representation(
-            X_subset, y_series, k_bin=3, n_jobs=2
-        )
-        
-        # Should get same features (order may differ)
-        assert set(selected_serial) == set(selected_parallel)
-        
-    def test_supervised_binning_edge_cases(self, synthetic_single_window):
-        """Test edge cases: single feature, all noise."""
-        from feature_selection import supervised_binning_and_representation
-        
-        X_df, y_series = synthetic_single_window
-        
-        # Single feature
-        X_single = X_df.iloc[:, [0]]
-        selected, diag = supervised_binning_and_representation(
-            X_single, y_series, k_bin=3, n_jobs=1
-        )
-        
-        assert isinstance(selected, list)
-        assert diag['n_start'] == 1
-        # Should select either raw or binned version
-        assert 0 <= diag['n_total_selected'] <= 1
+# NOTE: TestSupervisedBinning class removed - binning deprecated in v3 pipeline
 
 
 # ============================================================================
@@ -1489,7 +1363,8 @@ class TestIntegration:
         assert isinstance(diagnostics, dict)
         assert 'ic_filter' in diagnostics
         assert 'stability' in diagnostics
-        assert 'binning' in diagnostics
+        # NOTE: binning removed in v3 pipeline - no longer required
+        # assert 'binning' in diagnostics
         assert 'redundancy' in diagnostics
         assert 'standardization' in diagnostics
         assert 'elasticnet' in diagnostics
