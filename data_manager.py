@@ -4,6 +4,7 @@ Intelligent Data Manager for Cross-Sectional Momentum Strategy
 Implements incremental data downloading:
 - Downloads ETF OHLCV data to cache directory
 - Downloads macro data (VIX, yields)
+- Downloads FRED data (sentiment, conditions, credit spreads)
 - Only downloads missing dates
 - Preserves existing data and merges intelligently
 
@@ -12,6 +13,7 @@ Based on alpha_signals data_manager.py philosophy.
 
 from __future__ import annotations
 import datetime as dt
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
@@ -22,6 +24,38 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import logging
+
+
+# ============================================================================
+# FRED SERIES DEFINITIONS
+# ============================================================================
+# These are the FRED series used for macro/sentiment features
+
+FRED_SERIES = {
+    # ---- Interest Rates & Yield Curve ----
+    'DGS2': 'tsy_2y',                   # 2-Year Treasury
+    'DGS10': 'tsy_10y',                 # 10-Year Treasury
+    'DGS30': 'tsy_30y',                 # 30-Year Treasury
+    'T10Y2Y': 'yc_slope_10_2',          # 10Y-2Y Spread (pre-calculated)
+    
+    # ---- Credit Spreads ----
+    'BAMLC0A0CM': 'ig_spread',          # IG Corporate Bond Spread
+    'BAMLH0A0HYM2': 'hy_spread',        # HY Corporate Bond Spread
+    
+    # ---- Inflation ----
+    'T10YIE': 'breakeven_10y',          # 10Y Breakeven Inflation
+    
+    # ---- Financial Conditions ----
+    'NFCI': 'chicago_fci',              # Chicago Fed National FCI
+    'STLFSI4': 'stl_fsi',               # St. Louis Fed FSI
+    
+    # ---- Sentiment / Uncertainty ----
+    'UMCSENT': 'umich_sentiment',       # U. Michigan Consumer Sentiment
+    'USEPUINDXD': 'epu_daily',          # Economic Policy Uncertainty (daily)
+    
+    # ---- Labor Market ----
+    'ICSA': 'initial_claims',           # Initial Jobless Claims (weekly)
+}
 
 
 class CrossSecMomDataManager:
@@ -51,6 +85,12 @@ class CrossSecMomDataManager:
         
         self.macro_dir = self.data_dir / "macro"
         self.macro_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.fred_dir = self.data_dir / "fred"
+        self.fred_dir.mkdir(parents=True, exist_ok=True)
+        
+        # FRED API client (lazy initialization)
+        self._fred = None
         
         # Suppress yfinance's verbose error messages
         logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -505,6 +545,155 @@ class CrossSecMomDataManager:
             print(f"  Loaded {name}: {len(data_series)} observations")
 
         return macro_data
+
+    def _get_fred_client(self):
+        """
+        Lazy initialization of FRED API client.
+        Requires FRED_API_KEY environment variable.
+        """
+        if self._fred is None:
+            api_key = os.environ.get('FRED_API_KEY')
+            if api_key:
+                try:
+                    from fredapi import Fred
+                    self._fred = Fred(api_key=api_key)
+                    print("[FRED] API initialized successfully")
+                except ImportError:
+                    warnings.warn("fredapi not installed. Run: pip install fredapi")
+                except Exception as e:
+                    warnings.warn(f"Failed to initialize FRED API: {e}")
+            else:
+                warnings.warn(
+                    "FRED_API_KEY not set. Get free key from: "
+                    "https://fred.stlouisfed.org/docs/api/api_key.html"
+                )
+        return self._fred
+
+    def load_or_download_fred_data(
+        self,
+        series_dict: Optional[Dict[str, str]] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        force_refresh: bool = False,
+    ) -> Dict[str, pd.Series]:
+        """
+        Load FRED macro/sentiment data with incremental updates.
+        
+        Parameters
+        ----------
+        series_dict : Dict[str, str], optional
+            Dict of {FRED_CODE: friendly_name}. If None, uses FRED_SERIES default.
+        start_date : str, optional
+            Start date (YYYY-MM-DD). Default "2010-01-01"
+        end_date : str, optional
+            End date (YYYY-MM-DD). Default today.
+        force_refresh : bool
+            If True, re-download even if cached.
+            
+        Returns
+        -------
+        Dict[str, pd.Series]
+            Dictionary of {friendly_name: Series} for FRED data
+        """
+        end_date = end_date or dt.date.today().isoformat()
+        start_date = start_date or "2010-01-01"
+        
+        if series_dict is None:
+            series_dict = FRED_SERIES
+        
+        print(f"[FRED] Loading {len(series_dict)} series from {start_date} to {end_date}")
+        
+        fred_data = {}
+        
+        for fred_code, friendly_name in series_dict.items():
+            cache_path = self.fred_dir / f"FRED_{friendly_name}.csv"
+            
+            # Try to load cached data first
+            cached_data = None
+            if cache_path.exists() and not force_refresh:
+                try:
+                    df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+                    if 'value' in df.columns:
+                        cached_data = df['value']
+                    else:
+                        cached_data = df.iloc[:, 0]
+                    
+                    # Ensure timezone-naive
+                    if cached_data.index.tz is not None:
+                        cached_data.index = cached_data.index.tz_localize(None)
+                    
+                    last_date = cached_data.index.max().strftime("%Y-%m-%d")
+                    
+                    # Check if update needed
+                    today = dt.date.today().isoformat()
+                    needs_update = last_date < end_date and last_date < today
+                    
+                    if not needs_update:
+                        # Use cached data
+                        data_series = cached_data
+                        if start_date:
+                            start_dt = pd.to_datetime(start_date)
+                            data_series = data_series[data_series.index >= start_dt]
+                        if end_date:
+                            end_dt = pd.to_datetime(end_date)
+                            data_series = data_series[data_series.index <= end_dt]
+                        
+                        fred_data[friendly_name] = data_series.dropna()
+                        print(f"  [OK] {friendly_name}: {len(data_series)} observations (cached)")
+                        continue
+                        
+                except Exception as e:
+                    warnings.warn(f"Failed to load cached {friendly_name}: {e}")
+                    cached_data = None
+            
+            # Download from FRED
+            fred = self._get_fred_client()
+            if fred is None:
+                warnings.warn(f"Cannot download {friendly_name}: FRED API not available")
+                fred_data[friendly_name] = pd.Series(dtype=float)
+                continue
+            
+            try:
+                print(f"  [DOWNLOAD] {friendly_name} ({fred_code})...")
+                
+                # Download the series
+                data = fred.get_series(fred_code, observation_start=start_date, observation_end=end_date)
+                
+                if data is not None and len(data) > 0:
+                    # Ensure timezone-naive
+                    if data.index.tz is not None:
+                        data.index = data.index.tz_localize(None)
+                    
+                    # Merge with cached if exists
+                    if cached_data is not None and len(cached_data) > 0:
+                        combined = pd.concat([cached_data, data]).sort_index()
+                        combined = combined[~combined.index.duplicated(keep='last')]
+                    else:
+                        combined = data
+                    
+                    # Save to cache
+                    pd.DataFrame({'value': combined}).to_csv(cache_path)
+                    
+                    # Filter to requested range
+                    data_series = combined
+                    if start_date:
+                        start_dt = pd.to_datetime(start_date)
+                        data_series = data_series[data_series.index >= start_dt]
+                    if end_date:
+                        end_dt = pd.to_datetime(end_date)
+                        data_series = data_series[data_series.index <= end_dt]
+                    
+                    fred_data[friendly_name] = data_series.dropna()
+                    print(f"  [OK] {friendly_name}: {len(data_series)} observations")
+                else:
+                    print(f"  [WARNING] {friendly_name}: No data from FRED")
+                    fred_data[friendly_name] = pd.Series(dtype=float)
+                    
+            except Exception as e:
+                print(f"  [ERROR] {friendly_name}: {e}")
+                fred_data[friendly_name] = pd.Series(dtype=float)
+        
+        return fred_data
 
     def download_ohlcv_data(
         self,

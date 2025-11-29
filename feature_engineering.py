@@ -32,6 +32,106 @@ from config import ResearchConfig
 from data_manager import download_etf_data, CrossSecMomDataManager, filter_tickers_for_research_window, clean_raw_ohlcv_data  # Import from data_manager instead
 
 # ============================================================================
+# FACTOR FAMILY CLASSIFICATION
+# ============================================================================
+# Used for factor grouping in LARS and feature family reporting
+
+FACTOR_GROUPS = {
+    'momentum': {
+        'patterns': ['Close%-', 'RSI', 'Williams', 'MACD', 'ROC', 'Mom', '_lag'],
+        'target_representatives': 5,
+    },
+    'volatility': {
+        'patterns': ['std', 'ATR', 'BBW', 'parkinson', 'garman_klass', 'rogers_satchell', 'skew', 'kurt'],
+        'target_representatives': 5,
+    },
+    'volume': {
+        'patterns': ['volume', 'rel_vol', 'obv', 'up_down_vol', 'pv_corr', 'vol_per_atr'],
+        'target_representatives': 4,
+    },
+    'liquidity': {
+        'patterns': ['amihud', 'spread', 'kyle', 'illiq', 'roll_spread', 'cs_spread', 'ADV_'],
+        'target_representatives': 4,
+    },
+    'trend': {
+        'patterns': ['MA', 'EMA', 'adx', 'trend_r2', 'slope', 'trend_strength', 'trend_regime', 'Boll'],
+        'target_representatives': 4,
+    },
+    'risk': {
+        'patterns': ['beta', 'idio', 'corr_mkt', 'semi_vol', 'max_dd', 'var_', 'cvar', 'down_corr', 'DD', 'Hurst'],
+        'target_representatives': 5,
+    },
+    'macro': {
+        'patterns': ['vix', 'yc_', 'hy_spread', 'fci', 'fsi', 'claims', 'real_rate', 'credit', 'short_rate'],
+        'target_representatives': 5,
+    },
+    'sentiment': {
+        'patterns': ['sentiment', 'epu', 'umich', 'uncertainty'],
+        'target_representatives': 3,
+    },
+    'structure': {
+        'patterns': ['regime', 'streak', 'zscore', 'days_since', 'alignment', 'pct_from', 'vol_of_vol'],
+        'target_representatives': 4,
+    },
+    'interaction': {
+        'patterns': ['_x_', '_div_', '_minus_', '_sq', '_cb', '_in_'],
+        'target_representatives': 10,
+    },
+}
+
+
+def classify_feature_family(feature_name: str) -> str:
+    """
+    Classify a feature into its factor family based on name patterns.
+    
+    Returns family name or 'other' if no match.
+    """
+    feature_lower = feature_name.lower()
+    
+    for family, config in FACTOR_GROUPS.items():
+        for pattern in config['patterns']:
+            if pattern.lower() in feature_lower:
+                return family
+    
+    return 'other'
+
+
+def get_family_features(feature_columns: list) -> Dict[str, list]:
+    """
+    Group feature columns by factor family.
+    
+    Returns dict of {family: [feature_names]}
+    """
+    families = {family: [] for family in FACTOR_GROUPS.keys()}
+    families['other'] = []
+    
+    for col in feature_columns:
+        family = classify_feature_family(col)
+        families[family].append(col)
+    
+    return families
+
+
+def print_family_summary(feature_columns: list) -> None:
+    """Print a summary of features by family."""
+    families = get_family_features(feature_columns)
+    
+    print("\n" + "="*60)
+    print("FEATURE FAMILY SUMMARY")
+    print("="*60)
+    
+    total = 0
+    for family, features in sorted(families.items(), key=lambda x: -len(x[1])):
+        if features:
+            print(f"  {family:15s}: {len(features):4d} features")
+            total += len(features)
+    
+    print("-"*60)
+    print(f"  {'TOTAL':15s}: {total:4d} features")
+    print("="*60)
+
+
+# ============================================================================
 # DATA VALIDATION UTILITIES
 # ============================================================================
 # These functions validate data availability EARLY to catch problems before
@@ -697,6 +797,292 @@ def shock_features(returns, vol_60d):
         f'{returns.name}_Ret1dZ': ret_1d_z
     }
 
+
+# ============================================================================
+# V2 FEATURE FAMILIES: VOLUME, LIQUIDITY, RISK/BETA, STRUCTURE
+# ============================================================================
+# These families provide orthogonal signals to complement momentum/volatility
+
+def compute_volume_features(
+    close: pd.Series,
+    volume: pd.Series,
+    high: pd.Series = None,
+    low: pd.Series = None,
+) -> Dict[str, pd.Series]:
+    """
+    Compute volume-based features from OHLCV data.
+    
+    Features:
+    - Relative volume (vs rolling mean)
+    - Volume z-score
+    - Volume trend (short vs long MA)
+    - Price-volume correlation
+    - OBV slope
+    - Up/down volume ratio
+    - Volume breakout/dryup flags
+    """
+    feats = {}
+    
+    if volume is None or volume.isna().all():
+        return feats
+    
+    returns = close.pct_change()
+    
+    # ---- Relative Volume ----
+    for window in [10, 20, 60]:
+        vol_ma = volume.rolling(window, min_periods=window//2).mean()
+        feats[f'rel_volume_{window}'] = (volume / vol_ma).astype('float32')
+    
+    # ---- Volume Z-Score ----
+    for window in [20, 60]:
+        vol_mean = volume.rolling(window, min_periods=window//2).mean()
+        vol_std = volume.rolling(window, min_periods=window//2).std()
+        feats[f'volume_zscore_{window}'] = ((volume - vol_mean) / (vol_std + 1e-8)).astype('float32')
+    
+    # ---- Volume Trend (short/long ratio) ----
+    vol_ma_10 = volume.rolling(10, min_periods=5).mean()
+    vol_ma_50 = volume.rolling(50, min_periods=25).mean()
+    feats['volume_trend_10_50'] = (vol_ma_10 / (vol_ma_50 + 1e-8)).astype('float32')
+    
+    # ---- Price-Volume Correlation ----
+    for window in [21, 63]:
+        pv_corr = returns.rolling(window, min_periods=window//2).corr(volume.pct_change())
+        feats[f'pv_corr_{window}'] = pv_corr.astype('float32')
+    
+    # ---- OBV (On-Balance Volume) Slope ----
+    obv = (np.sign(returns) * volume).cumsum()
+    for window in [21, 63]:
+        obv_slope = obv.diff(window) / window
+        feats[f'obv_slope_{window}'] = obv_slope.astype('float32')
+    
+    # ---- Up/Down Volume Ratio ----
+    for window in [21, 63]:
+        up_vol = volume.where(returns > 0, 0).rolling(window, min_periods=window//2).sum()
+        down_vol = volume.where(returns < 0, 0).rolling(window, min_periods=window//2).sum()
+        feats[f'up_down_vol_ratio_{window}'] = (up_vol / (down_vol + 1e-8)).astype('float32')
+    
+    # ---- Volume Anomalies ----
+    vol_90pct = volume.rolling(60, min_periods=30).quantile(0.9)
+    vol_10pct = volume.rolling(60, min_periods=30).quantile(0.1)
+    feats['volume_breakout_60'] = (volume > vol_90pct).astype('float32')
+    feats['volume_dryup_60'] = (volume < vol_10pct).astype('float32')
+    
+    # ---- Volume per ATR (normalized activity) ----
+    if high is not None and low is not None:
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs()
+        ], axis=1).max(axis=1)
+        atr_14 = tr.rolling(14, min_periods=7).mean()
+        feats['volume_per_atr'] = (volume / (atr_14 * close + 1e-8)).astype('float32')
+    
+    return feats
+
+
+def compute_liquidity_features(
+    close: pd.Series,
+    volume: pd.Series,
+    high: pd.Series = None,
+    low: pd.Series = None,
+    open_: pd.Series = None,
+) -> Dict[str, pd.Series]:
+    """
+    Compute liquidity and microstructure proxy features.
+    
+    Features:
+    - Amihud illiquidity (|return| / dollar_volume)
+    - Roll implied spread
+    - Corwin-Schultz high-low spread estimator
+    - Kyle's lambda proxy
+    - Range-based volatility estimators (Parkinson, Garman-Klass, Rogers-Satchell)
+    """
+    feats = {}
+    returns = close.pct_change()
+    
+    if volume is None or volume.isna().all():
+        return feats
+    
+    dollar_volume = close * volume
+    
+    # ---- Amihud Illiquidity (2002) ----
+    # Higher = less liquid
+    amihud_daily = np.abs(returns) / (dollar_volume + 1e-8)
+    for window in [21, 63, 126]:
+        feats[f'amihud_{window}'] = amihud_daily.rolling(window, min_periods=window//2).mean().astype('float32')
+    
+    # Log-amihud for stability
+    feats['log_amihud_63'] = np.log1p(amihud_daily.rolling(63, min_periods=30).mean() * 1e6).astype('float32')
+    
+    # ---- Roll (1984) Implied Spread ----
+    # Spread ≈ 2 * sqrt(-cov(r_t, r_{t-1})) when cov < 0
+    for window in [21, 63]:
+        cov = returns.rolling(window, min_periods=window//2).cov(returns.shift(1))
+        roll_spread = 2 * np.sqrt(np.maximum(-cov, 0))
+        feats[f'roll_spread_{window}'] = roll_spread.astype('float32')
+    
+    # ---- Kyle's Lambda Proxy (price impact) ----
+    # |return| / sqrt(volume)
+    kyle_lambda = np.abs(returns) / (np.sqrt(volume) + 1e-8)
+    for window in [21, 63]:
+        feats[f'kyle_lambda_{window}'] = kyle_lambda.rolling(window, min_periods=window//2).mean().astype('float32')
+    
+    # ---- Range-Based Volatility Estimators ----
+    if high is not None and low is not None:
+        # Parkinson (1980) - High-Low only
+        log_hl = np.log(high / low)
+        parkinson_var = (1 / (4 * np.log(2))) * (log_hl ** 2)
+        for window in [21, 63]:
+            parkinson_vol = np.sqrt(parkinson_var.rolling(window, min_periods=window//2).mean())
+            feats[f'parkinson_vol_{window}'] = parkinson_vol.astype('float32')
+        
+        if open_ is not None:
+            # Garman-Klass (1980) - OHLC
+            log_hl_sq = (np.log(high / low)) ** 2
+            log_co_sq = (np.log(close / open_)) ** 2
+            gk_var = 0.5 * log_hl_sq - (2 * np.log(2) - 1) * log_co_sq
+            for window in [21, 63]:
+                gk_vol = np.sqrt(gk_var.rolling(window, min_periods=window//2).mean().clip(lower=0))
+                feats[f'garman_klass_vol_{window}'] = gk_vol.astype('float32')
+            
+            # Rogers-Satchell (1991) - drift-independent
+            rs_var = (np.log(high / close) * np.log(high / open_) + 
+                      np.log(low / close) * np.log(low / open_))
+            for window in [21, 63]:
+                rs_vol = np.sqrt(rs_var.rolling(window, min_periods=window//2).mean().clip(lower=0))
+                feats[f'rogers_satchell_vol_{window}'] = rs_vol.astype('float32')
+        
+        # ---- Corwin-Schultz (2012) High-Low Spread Estimator ----
+        beta = (np.log(high / low)) ** 2
+        high_2d = high.rolling(2).max()
+        low_2d = low.rolling(2).min()
+        gamma = (np.log(high_2d / low_2d)) ** 2
+        
+        sqrt_2 = np.sqrt(2)
+        alpha_denom = 3 - 2 * sqrt_2
+        alpha = ((np.sqrt(2 * beta) - np.sqrt(beta)) / alpha_denom - 
+                 np.sqrt(gamma / alpha_denom))
+        cs_spread = 2 * (np.exp(alpha) - 1) / (1 + np.exp(alpha))
+        cs_spread = cs_spread.clip(lower=0, upper=0.5)  # Cap at 50% spread
+        
+        for window in [21, 63]:
+            feats[f'cs_spread_{window}'] = cs_spread.rolling(window, min_periods=window//2).mean().astype('float32')
+    
+    return feats
+
+
+def compute_structure_features(
+    close: pd.Series,
+    returns: pd.Series,
+    volatility_21: pd.Series = None,
+) -> Dict[str, pd.Series]:
+    """
+    Compute structure, shape, and regime features.
+    
+    Features:
+    - Volatility regime (low/med/high quantile)
+    - Trend regime (strong up/chop/strong down)
+    - Momentum streak length
+    - Days since sign flip
+    - Price z-score vs MA
+    - Mean reversion indicators
+    - Trend R² (strength)
+    """
+    feats = {}
+    
+    # ---- Volatility Regime ----
+    realized_vol = returns.rolling(21, min_periods=10).std()
+    vol_pct = realized_vol.rolling(252, min_periods=126).rank(pct=True)
+    feats['vol_regime_pct'] = vol_pct.astype('float32')
+    
+    # Vol regime classification (0=low, 1=med, 2=high)
+    feats['vol_regime_class'] = pd.cut(
+        vol_pct, bins=[0, 0.33, 0.67, 1.0], labels=[0, 1, 2], include_lowest=True
+    ).astype('float32')
+    
+    # Time in current vol regime
+    vol_class = feats['vol_regime_class']
+    vol_regime_change = vol_class != vol_class.shift(1)
+    vol_regime_duration = vol_regime_change.astype(int).groupby(vol_regime_change.cumsum()).cumcount()
+    feats['vol_regime_duration'] = vol_regime_duration.astype('float32')
+    
+    # Vol of vol
+    feats['vol_of_vol_63'] = realized_vol.rolling(63, min_periods=30).std().astype('float32')
+    
+    # ---- Trend Regime ----
+    mom_21 = close.pct_change(21)
+    mom_63 = close.pct_change(63)
+    vol_21 = volatility_21 if volatility_21 is not None else realized_vol
+    
+    # Trend strength = |momentum| / volatility
+    trend_strength = np.abs(mom_21) / (vol_21 + 1e-8)
+    feats['trend_strength_21'] = trend_strength.astype('float32')
+    
+    # Trend alignment (short and medium momentum same sign)
+    aligned = (np.sign(mom_21) == np.sign(mom_63)).astype(float)
+    feats['trend_alignment'] = aligned.astype('float32')
+    
+    # Trend regime score (-2 to +2)
+    direction = np.sign(mom_21)
+    strong = (trend_strength > 1) & (aligned == 1)
+    trend_score = direction * (1 + strong.astype(float))
+    trend_score = trend_score.where(trend_strength >= 0.5, 0)  # Chop if weak
+    feats['trend_regime_score'] = trend_score.astype('float32')
+    
+    # ---- Streak / Persistence Features ----
+    # Days since last sign flip of momentum
+    mom_sign = np.sign(mom_21)
+    sign_flip = mom_sign != mom_sign.shift(1)
+    days_since_flip = sign_flip.astype(int).groupby(sign_flip.cumsum()).cumcount()
+    feats['days_since_mom_flip'] = days_since_flip.astype('float32')
+    
+    # Current up/down streak (daily returns)
+    ret_sign = np.sign(returns)
+    streak_change = ret_sign != ret_sign.shift(1)
+    streak_length = streak_change.astype(int).groupby(streak_change.cumsum()).cumcount() + 1
+    feats['price_streak'] = (streak_length * ret_sign).astype('float32')
+    
+    # ---- Mean Reversion Indicators ----
+    for window in [50, 200]:
+        sma = close.rolling(window, min_periods=window//2).mean()
+        std = close.rolling(window, min_periods=window//2).std()
+        zscore = (close - sma) / (std + 1e-8)
+        feats[f'price_zscore_{window}'] = zscore.astype('float32')
+    
+    # Distance from recent high/low
+    high_52w = close.rolling(252, min_periods=126).max()
+    low_52w = close.rolling(252, min_periods=126).min()
+    feats['pct_from_52w_high'] = ((close - high_52w) / high_52w).astype('float32')
+    feats['pct_from_52w_low'] = ((close - low_52w) / low_52w).astype('float32')
+    
+    # ---- Trend R² (Goodness of Fit) ----
+    for window in [21, 63]:
+        def trend_r2(prices):
+            if len(prices) < window // 2:
+                return np.nan
+            y = prices.values
+            x = np.arange(len(y))
+            
+            # Fit linear regression
+            x_mean = x.mean()
+            y_mean = y.mean()
+            
+            ss_xy = ((x - x_mean) * (y - y_mean)).sum()
+            ss_xx = ((x - x_mean) ** 2).sum()
+            ss_yy = ((y - y_mean) ** 2).sum()
+            
+            if ss_xx == 0 or ss_yy == 0:
+                return np.nan
+            
+            r = ss_xy / np.sqrt(ss_xx * ss_yy)
+            return r ** 2
+        
+        r2 = close.rolling(window, min_periods=window//2).apply(trend_r2, raw=False)
+        feats[f'trend_r2_{window}'] = r2.astype('float32')
+    
+    return feats
+
+
 # ============================================================================
 # PER-TICKER FEATURE ENGINEERING
 # ============================================================================
@@ -795,6 +1181,31 @@ def process_ticker(
         # Need vol_60d for ret_1d_z calculation
         vol_60d = close_pct_clipped.rolling(window=60, min_periods=30).std()
         feats.update(shock_features(close_pct_clipped, vol_60d))
+        
+        # =====================================================================
+        # V2 FEATURE FAMILIES: Volume, Liquidity, Structure
+        # =====================================================================
+        # These add orthogonal signals beyond momentum/volatility
+        
+        # Volume features (from OHLCV)
+        if 'Volume' in data.columns:
+            vol = data['Volume'].astype('float32')
+            high = data['High'].astype('float32') if 'High' in data.columns else None
+            low = data['Low'].astype('float32') if 'Low' in data.columns else None
+            feats.update(compute_volume_features(close, vol, high, low))
+        
+        # Liquidity / microstructure features
+        if 'Volume' in data.columns:
+            vol = data['Volume'].astype('float32')
+            high = data['High'].astype('float32') if 'High' in data.columns else None
+            low = data['Low'].astype('float32') if 'Low' in data.columns else None
+            open_ = data['Open'].astype('float32') if 'Open' in data.columns else None
+            feats.update(compute_liquidity_features(close, vol, high, low, open_))
+        
+        # Structure / regime features
+        returns_decimal = close.pct_change()  # decimal returns for structure
+        volatility_21 = returns_decimal.rolling(21, min_periods=10).std()
+        feats.update(compute_structure_features(close, returns_decimal, volatility_21))
         
         # Convert to DataFrame
         df = pd.DataFrame(feats, index=data.index)
@@ -1295,11 +1706,29 @@ def generate_interaction_features(panel_df: pd.DataFrame, config: ResearchConfig
     relative_features = [c for c in all_cols if 'Rel' in c and 'vs' in c]
     correlation_features = [c for c in all_cols if 'Corr' in c]
     
+    # V2 FEATURE FAMILIES (orthogonal signal families)
+    volume_features = [c for c in all_cols if any(x in c for x in [
+        'rel_volume', 'volume_zscore', 'volume_trend', 'pv_corr', 'obv_slope',
+        'up_down_vol', 'volume_breakout', 'volume_dryup', 'volume_per_atr'
+    ])]
+    liquidity_v2_features = [c for c in all_cols if any(x in c for x in [
+        'amihud', 'roll_spread', 'kyle_lambda', 'parkinson_vol', 'garman_klass',
+        'rogers_satchell', 'cs_spread', 'log_amihud'
+    ])]
+    structure_features = [c for c in all_cols if any(x in c for x in [
+        'vol_regime', 'trend_strength', 'trend_alignment', 'trend_regime',
+        'days_since', 'price_streak', 'price_zscore', 'pct_from_52w', 'trend_r2',
+        'vol_of_vol'
+    ])]
+    
     print(f"[interaction] Momentum features: {len(momentum_features)}")
     print(f"[interaction] Volatility features: {len(volatility_features)}")
     print(f"[interaction] Oscillator features: {len(oscillator_features)}")
     print(f"[interaction] Macro features: {len(macro_features)}")
     print(f"[interaction] Regime flags: {len(regime_flags)}")
+    print(f"[interaction] Volume features (V2): {len(volume_features)}")
+    print(f"[interaction] Liquidity features (V2): {len(liquidity_v2_features)}")
+    print(f"[interaction] Structure features (V2): {len(structure_features)}")
     
     interaction_count = 0
     
@@ -1499,6 +1928,90 @@ def generate_interaction_features(panel_df: pd.DataFrame, config: ResearchConfig
                 panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
                 interaction_count += 1
         print(f"      Generated {interaction_count - start_count} Vol×Regime interactions")
+    
+    # =========================================================================
+    # Type 6: V2 CROSS-FAMILY INTERACTIONS
+    # =========================================================================
+    # New interactions between orthogonal V2 families
+    
+    print("\n[interaction] Type 6: V2 Cross-Family Interactions...")
+    
+    # 6.1 Momentum × Volume (conviction-weighted momentum)
+    if volume_features:
+        print("  [6.1] Mom × Volume (conviction-weighted)...")
+        start_count = interaction_count
+        for feat1 in momentum_features[:10]:  # Top 10 momentum features
+            for feat2 in volume_features[:5]:  # Top 5 volume features
+                new_col = f"{feat1}_x_{feat2}"
+                panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Mom×Volume interactions")
+    
+    # 6.2 Momentum × Liquidity (liquidity-adjusted momentum)
+    if liquidity_v2_features:
+        print("  [6.2] Mom × Liquidity (V2)...")
+        start_count = interaction_count
+        for feat1 in momentum_features[:10]:
+            for feat2 in liquidity_v2_features[:5]:
+                new_col = f"{feat1}_x_{feat2}"
+                panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Mom×Liquidity(V2) interactions")
+    
+    # 6.3 Volatility × Liquidity (stress-liquidity interactions)
+    if liquidity_v2_features:
+        print("  [6.3] Vol × Liquidity (V2)...")
+        start_count = interaction_count
+        for feat1 in volatility_features[:5]:
+            for feat2 in liquidity_v2_features[:5]:
+                new_col = f"{feat1}_x_{feat2}"
+                panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Vol×Liquidity(V2) interactions")
+    
+    # 6.4 Momentum × Structure (momentum conditioned on regime)
+    if structure_features:
+        print("  [6.4] Mom × Structure (regime-conditional)...")
+        start_count = interaction_count
+        for feat1 in momentum_features[:10]:
+            for feat2 in structure_features[:5]:
+                new_col = f"{feat1}_x_{feat2}"
+                panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Mom×Structure interactions")
+    
+    # 6.5 Volume × Liquidity (microstructure interactions)
+    if volume_features and liquidity_v2_features:
+        print("  [6.5] Volume × Liquidity (microstructure)...")
+        start_count = interaction_count
+        for feat1 in volume_features[:5]:
+            for feat2 in liquidity_v2_features[:5]:
+                new_col = f"{feat1}_x_{feat2}"
+                panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Volume×Liquidity interactions")
+    
+    # 6.6 Volatility × Structure (vol-regime interactions)
+    if structure_features:
+        print("  [6.6] Vol × Structure (vol-regime)...")
+        start_count = interaction_count
+        for feat1 in volatility_features[:5]:
+            for feat2 in structure_features[:5]:
+                new_col = f"{feat1}_x_{feat2}"
+                panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Vol×Structure interactions")
+    
+    # 6.7 Trend × Volume (trend confirmation)
+    if trend_features and volume_features:
+        print("  [6.7] Trend × Volume (trend confirmation)...")
+        start_count = interaction_count
+        for feat1 in trend_features[:5]:
+            for feat2 in volume_features[:5]:
+                new_col = f"{feat1}_x_{feat2}"
+                panel_df[new_col] = (panel_df[feat1] * panel_df[feat2]).astype('float32')
+                interaction_count += 1
+        print(f"      Generated {interaction_count - start_count} Trend×Volume interactions")
     
     # =========================================================================
     # VALIDATION
