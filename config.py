@@ -39,7 +39,7 @@ class TimeConfig:
     
     # Walk-forward parameters (all in trading days)
     FEATURE_MAX_LAG_DAYS: int = 252  # Longest lookback in feature construction (1 year)
-    TRAINING_WINDOW_DAYS: int = 1260  # Training window length (5 years ≈ 252*5)
+    TRAINING_WINDOW_DAYS: int = 1008  # Training window length (4 years ≈ 252*4)
     HOLDING_PERIOD_DAYS: int = 21     # Forward return horizon (1 month)
     STEP_DAYS: int = 21               # Rebalancing frequency (1 month)
 
@@ -62,7 +62,7 @@ class UniverseConfig:
     exclude_non_canonical: bool = True  # Exclude non-canonical duplicates
     
     # PHASE 0: Asset class filter to test equity-only vs cross-asset
-    equity_only: bool = True  # If True, filter to equity families only (excludes bonds, commodities, etc.)
+    equity_only: bool = False  # DISABLED: family metadata is UNKNOWN - enable when metadata is populated
     equity_family_keywords: list = None  # Keywords to identify equity families
     
     def __post_init__(self):
@@ -331,28 +331,87 @@ class FeatureConfig:
     enable_winsorization: bool = False  # If True, winsorize forward returns at ±n_sigma to reduce outlier noise
     winsorization_n_sigma: float = 2.5  # Number of standard deviations for winsorization bounds
     
-    # Binning control
-    use_manual_binning_candidates: bool = False  # If True, use hardcoded binning_candidates; if False, bin ALL features
-    binning_candidates: List[str] = None         # Manual list of features to bin (only used if use_manual_binning_candidates=True)
+    # === NaN HANDLING CONFIGURATION ===
+    # NaN handling is done at the SOURCE (feature_engineering.py) to ensure clean data
+    # downstream. Feature selection receives NaN-free data and will FAIL if NaN exists.
     
-    # Feature selection
-    ic_threshold: float = 0.02        # Minimum absolute IC for feature selection
-    max_features: int = 20            # Maximum features to select
+    # Raw data NaN handling (before feature calculation)
+    raw_data_min_valid_pct: float = 0.80  # Minimum fraction of valid (non-NaN) observations for a ticker
+    raw_data_ffill_limit: int = 5         # Max consecutive days to forward-fill (avoids look-ahead)
     
-    # Binning parameters
-    bin_max_depth: int = 3            # Max depth for decision tree binning
-    bin_min_samples_leaf: int = 100   # Min samples per leaf
-    n_bins: int = 8                  # Target number of bins
+    # Feature NaN threshold (features with > threshold NaN are dropped)
+    feature_nan_threshold: float = 0.10   # Drop features with >10% NaN (configurable)
+    
+    # Post-feature imputation (for remaining "innocent" NaN after rolling windows)
+    # Cross-sectional median imputation (per-date) avoids forward leakage
+    enable_nan_imputation: bool = True    # If True, impute remaining NaN with cross-sectional median
+    
+    # === V3 PIPELINE PARAMETERS ===
+    
+    # Formation/Training window configuration
+    formation_years: float = 5.0        # Formation window length in years (default 5 years)
+    training_years: float = 1.0         # Training window length in years (default 1 year)
+    
+    # Time-decay half-life configuration
+    formation_halflife_days: int = 252  # Formation IC weighting half-life (~12 months)
+    training_halflife_days: int = 63    # Training IC weighting half-life (~3 months, can use 63-126)
+    
+    # Formation FDR parameters
+    formation_fdr_q_threshold: float = 0.10   # FDR control level (10% default, generous)
+    formation_ic_floor: float = 0.02          # Mild |IC| floor for formation
+    formation_use_mi: bool = False            # Toggle for MI gating (OFF by default, for future use)
+    
+    # Per-window ranking parameters
+    per_window_ic_floor: float = 0.02         # |IC| floor for per-window ranking (filters weak features)
+    per_window_top_k: int = 100               # Top K features to keep after univariate ranking
+    per_window_min_features: int = 50         # Minimum features to keep (K_min)
+    per_window_num_blocks: int = 3            # Number of contiguous blocks for sign consistency (B=3-5)
+    
+    # Redundancy/collinearity parameters
+    corr_threshold: float = 0.80              # Maximum correlation for redundancy filter (relaxed from 0.70)
+    
+    # LassoLarsIC parameters (replaces ElasticNet in v4 pipeline)
+    lars_min_features: int = 12               # Minimum features LassoLarsIC must select (BIC fallback)
+    lars_criterion: str = 'aic'               # Information criterion ('aic' selects more features than 'bic')
+    ridge_refit_alpha: float = 0.01           # Ridge alpha for final refit on LARS support
+    
+    # === DEPRECATED V2 PARAMETERS (kept for backward compatibility) ===
+    
+    # Binning control (DEPRECATED - not used in v3 pipeline)
+    use_manual_binning_candidates: bool = False  # DEPRECATED: If True, use hardcoded binning_candidates
+    binning_candidates: List[str] = None         # DEPRECATED: Manual list of features to bin
+    bin_max_depth: int = 3                       # DEPRECATED: Max depth for decision tree binning
+    bin_min_samples_leaf: int = 100              # DEPRECATED: Min samples per leaf
+    n_bins: int = 8                              # DEPRECATED: Target number of bins
+    
+    # Feature selection (DEPRECATED - use v3 parameters instead)
+    ic_threshold: float = 0.02        # DEPRECATED: Use per_window_ic_floor instead
+    max_features: int = 20            # DEPRECATED: Use per_window_top_k instead
     
     # Reproducibility
     random_state: Optional[int] = 42  # Random seed for reproducible results
+    
+    # === DEPRECATED V3 PARAMETERS (kept for backward compatibility) ===
+    # ElasticNet parameters (DEPRECATED - replaced by LassoLarsIC in v4)
+    alpha_grid: List[float] = None            # DEPRECATED: Alpha values for ElasticNetCV
+    l1_ratio_grid: List[float] = None         # DEPRECATED: L1 ratio values
+    elasticnet_cv_folds: int = 3              # DEPRECATED: Time-series CV folds
+    elasticnet_coef_threshold: float = 1e-4   # DEPRECATED: Minimum |coefficient|
     
     def __post_init__(self):
         # NOTE: base_features will remain None initially
         # It will be dynamically populated from panel data in alpha_models.py
         # This ensures ALL generated features are automatically included as candidates
         
+        # Initialize deprecated ElasticNet grids (for backward compatibility)
+        if self.alpha_grid is None:
+            self.alpha_grid = [0.0001, 0.001, 0.01, 0.1]
+        
+        if self.l1_ratio_grid is None:
+            self.l1_ratio_grid = [0.2, 0.5, 0.9]
+        
         # Only set default binning_candidates if manual mode is enabled and list is None
+        # (DEPRECATED: kept for backward compatibility only)
         if self.use_manual_binning_candidates and self.binning_candidates is None:
             # Expanded binning candidates to include diverse feature types
             # These will be binned to create supervised features
@@ -408,6 +467,10 @@ class ComputeConfig:
     # Persistence
     save_intermediate: bool = True    # Save intermediate objects
     ic_output_path: Optional[str] = None  # Path for IC vectors (defaults to plots_dir/ic_vectors.csv)
+    
+    # Debug/profiling mode: limit number of rebalance dates for single-window testing
+    # Set to 1 for profiling a single window, None for full backtest
+    max_rebalance_dates_for_debug: Optional[int] = None
 
 
 @dataclass
@@ -558,9 +621,28 @@ class ResearchConfig:
         assert self.portfolio.borrow_cost >= 0, "borrow_cost must be non-negative (deprecated)"
         
         # Feature config
-        assert self.features.ic_threshold >= 0, "ic_threshold must be non-negative"
-        assert self.features.max_features > 0, "max_features must be positive"
-        assert self.features.bin_max_depth > 0, "bin_max_depth must be positive"
+        assert self.features.formation_fdr_q_threshold > 0, "formation_fdr_q_threshold must be positive"
+        assert self.features.formation_ic_floor >= 0, "formation_ic_floor must be non-negative"
+        assert self.features.per_window_ic_floor >= 0, "per_window_ic_floor must be non-negative"
+        assert self.features.per_window_top_k > 0, "per_window_top_k must be positive"
+        assert self.features.per_window_min_features > 0, "per_window_min_features must be positive"
+        assert 3 <= self.features.per_window_num_blocks <= 5, "per_window_num_blocks must be in [3, 5]"
+        assert self.features.formation_years > 0, "formation_years must be positive"
+        assert self.features.training_years > 0, "training_years must be positive"
+        assert self.features.formation_halflife_days > 0, "formation_halflife_days must be positive"
+        assert self.features.training_halflife_days > 0, "training_halflife_days must be positive"
+        assert 0 < self.features.corr_threshold < 1, "corr_threshold must be in (0, 1)"
+        
+        # Deprecated parameters (warn but don't fail)
+        if self.features.use_manual_binning_candidates:
+            import warnings
+            warnings.warn(
+                "use_manual_binning_candidates is DEPRECATED in v3 pipeline. "
+                "Binning is not used in production code. "
+                "This parameter is kept only for backward compatibility.",
+                DeprecationWarning,
+                stacklevel=2
+            )
         
         return True
 
@@ -580,5 +662,12 @@ if __name__ == "__main__":
     print(f"  Training window: {config.time.TRAINING_WINDOW_DAYS} days")
     print(f"  Holding period: {config.time.HOLDING_PERIOD_DAYS} days")
     print(f"  Feature max lag: {config.time.FEATURE_MAX_LAG_DAYS} days")
-    print(f"  Base features: {len(config.features.base_features)}")
-    print(f"  Binning candidates: {len(config.features.binning_candidates)}")
+    print(f"  Base features: {len(config.features.base_features) if config.features.base_features else 'auto-discovered'}")
+    print(f"\nV3 Pipeline Configuration:")
+    print(f"  Formation window: {config.features.formation_years} years")
+    print(f"  Training window: {config.features.training_years} years")
+    print(f"  Formation half-life: {config.features.formation_halflife_days} days")
+    print(f"  Training half-life: {config.features.training_halflife_days} days")
+    print(f"  Formation FDR q-threshold: {config.features.formation_fdr_q_threshold}")
+    print(f"  Per-window top K: {config.features.per_window_top_k}")
+

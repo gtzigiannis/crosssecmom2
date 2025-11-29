@@ -12,10 +12,9 @@ Usage:
 
 # MUST be set BEFORE importing numpy/pandas to avoid Windows Intel MKL threading crashes
 import os
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
+for var in ("MKL_NUM_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", 
+            "NUMEXPR_NUM_THREADS", "BLAS_NUM_THREADS", "LAPACK_NUM_THREADS"):
+    os.environ.setdefault(var, "1")
 
 import argparse
 import pandas as pd

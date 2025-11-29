@@ -27,7 +27,7 @@ import warnings
 
 from config import ResearchConfig
 from alpha_models import AlphaModel
-from feature_selection import train_window_model, formation_fdr, formation_tune_elasticnet, compute_time_decay_weights
+from feature_selection import train_window_model, formation_fdr, compute_time_decay_weights, correlation_redundancy_filter
 from portfolio_construction import construct_portfolio, evaluate_portfolio_return
 from regime import compute_regime_series, get_portfolio_mode_for_regime
 from attribution_analysis import compute_attribution_analysis, save_attribution_results
@@ -67,11 +67,12 @@ def compute_formation_artifacts(
     -------
     dict or None
         Formation artifacts with keys:
-        - 'approved_features': List of features that passed IC+FDR
-        - 'best_alpha': Optimal ElasticNet alpha from Formation CV
-        - 'best_l1_ratio': Optimal ElasticNet l1_ratio from Formation CV
+        - 'approved_features': List of features that passed FDR + redundancy filter
         - 'formation_diagnostics': Dict with IC values, FDR stats, etc.
         Returns None if Formation window is invalid or computation fails.
+        
+    Note: V4 pipeline removes ElasticNet tuning from Formation.
+    LassoLarsIC in Training selects lambda automatically via BIC.
     """
     # Compute Formation window
     formation_days = int(config.features.formation_years * 252)  # Business days
@@ -79,7 +80,7 @@ def compute_formation_artifacts(
     t_formation_end = t0 - pd.Timedelta(days=1 + config.time.HOLDING_PERIOD_DAYS)
     
     if verbose:
-        print(f"[formation] Window: [{t_formation_start.date()}, {t_formation_end.date()}] ({formation_days} days)")
+        print(f"[formation] Window: [{t_formation_start.date()}, {t_formation_end.date()}] ({formation_days} days)", flush=True)
     
     # Check Formation window is valid
     if t_formation_end <= t_formation_start:
@@ -127,19 +128,26 @@ def compute_formation_artifacts(
     import time as time_module
     fdr_start = time_module.time()
     
+    # Determine n_jobs: force sequential execution in profiling mode
+    is_profiling_mode = (config.compute.max_rebalance_dates_for_debug is not None)
+    effective_n_jobs = 1 if is_profiling_mode else config.compute.n_jobs
+    if is_profiling_mode and verbose:
+        print(f"[formation] PROFILING MODE: n_jobs forced to 1 for accurate timing")
+    
     try:
+        # Formation phase runs BEFORE walk-forward
         approved_features, fdr_diagnostics = formation_fdr(
             X=X_formation,
             y=y_formation,
             dates=dates_formation,
             half_life=config.features.formation_halflife_days,
             fdr_level=config.features.formation_fdr_q_threshold,
-            n_jobs=4
+            n_jobs=effective_n_jobs
         )
         fdr_elapsed = time_module.time() - fdr_start
         
         if verbose:
-            print(f"[formation] FDR approved {len(approved_features)} features in {fdr_elapsed:.2f}s")
+            print(f"[formation] FDR approved {len(approved_features)} features in {fdr_elapsed:.2f}s", flush=True)
         
         if len(approved_features) == 0:
             if verbose:
@@ -153,66 +161,67 @@ def compute_formation_artifacts(
             traceback.print_exc()
         return None
     
-    # Run formation_tune_elasticnet to get hyperparameters
-    enet_start = time_module.time()
-    
+    # Run correlation redundancy filter on FDR-approved features
+    # This is the last step in Formation before ElasticNet tuning
+    redundancy_start = time_module.time()
     try:
-        # The data is already prepared; now filter to approved features for ElasticNet
-        available_approved = [f for f in approved_features if f in feature_cols]
+        # Filter X to only approved features for redundancy check
+        X_fdr_approved = X_formation[[f for f in approved_features if f in feature_cols]]
         
-        if len(available_approved) == 0:
-            if verbose:
-                print("[warn] No approved features available for ElasticNet tuning")
-            return None
-        
-        # Filter X to only approved features
-        X_approved = X_formation[available_approved]
-        
-        # Compute time-decay weights for formation data
-        weights = compute_time_decay_weights(
-            dates_formation,
-            train_end=dates_formation.max(),
-            half_life=config.features.formation_halflife_days
+        features_after_redundancy, redundancy_diagnostics = correlation_redundancy_filter(
+            X=X_fdr_approved,
+            corr_threshold=config.features.corr_threshold,
+            n_jobs=effective_n_jobs
         )
-        
-        # Call formation_tune_elasticnet
-        best_alpha, best_l1_ratio, enet_diagnostics = formation_tune_elasticnet(
-            X=X_approved,
-            y=y_formation,
-            dates=dates_formation,
-            approved_features=available_approved,
-            weights=weights,
-            alpha_grid=config.features.alpha_grid,
-            l1_ratio_grid=config.features.l1_ratio_grid,
-            cv_folds=3,
-            n_jobs=4
-        )
-        
-        enet_elapsed = time_module.time() - enet_start
+        redundancy_elapsed = time_module.time() - redundancy_start
         
         if verbose:
-            print(f"[formation] ElasticNet tuning: alpha={best_alpha:.4f}, l1_ratio={best_l1_ratio:.2f} in {enet_elapsed:.2f}s")
+            print(f"[formation] Redundancy filter: {len(approved_features)} -> {len(features_after_redundancy)} features in {redundancy_elapsed:.2f}s", flush=True)
         
+        # Update approved_features to only keep non-redundant ones
+        approved_features = features_after_redundancy
+        
+        if len(approved_features) == 0:
+            if verbose:
+                print("[warn] No features left after redundancy filter")
+            return None
+            
     except Exception as e:
         if verbose:
-            print(f"[error] formation_tune_elasticnet failed: {e}")
+            print(f"[error] correlation_redundancy_filter failed: {e}")
             import traceback
             traceback.print_exc()
-        return None
+        # Fall back to using FDR-approved features without redundancy filter
+        redundancy_elapsed = time_module.time() - redundancy_start
+        redundancy_diagnostics = {'error': str(e)}
+    
+    # V4 Pipeline: No ElasticNet tuning in Formation
+    # LassoLarsIC in Training phase automatically selects lambda via BIC criterion
+    # Formation now only does: FDR -> Redundancy filter -> output approved_features
     
     # Package artifacts
     formation_artifacts = {
         'approved_features': approved_features,
-        'best_alpha': best_alpha,
-        'best_l1_ratio': best_l1_ratio,
         'formation_diagnostics': {
             'fdr_diagnostics': fdr_diagnostics,
-            'enet_diagnostics': enet_diagnostics,
+            'redundancy_diagnostics': redundancy_diagnostics,
             'n_approved': len(approved_features),
+            'n_total_features': len(feature_cols),
             't_formation_start': t_formation_start,
             't_formation_end': t_formation_end,
+            'time_fdr': fdr_elapsed,
+            'time_redundancy': redundancy_elapsed,
         }
     }
+    
+    # Print formation summary
+    if verbose:
+        total_formation_time = fdr_elapsed + redundancy_elapsed
+        print(f"[formation] " + "-" * 30, flush=True)
+        print(f"[formation] SUMMARY:", flush=True)
+        print(f"[formation]   Features: {len(feature_cols)} -> {len(approved_features)} approved ({100*len(approved_features)/len(feature_cols):.1f}%)", flush=True)
+        print(f"[formation]   Time: FDR={fdr_elapsed:.1f}s, Redundancy={redundancy_elapsed:.1f}s, Total={total_formation_time:.1f}s", flush=True)
+        print(f"[formation] " + "-" * 30, flush=True)
     
     return formation_artifacts
 
@@ -283,7 +292,7 @@ def apply_universe_filters(
             # Only print once per run (first time filter is applied)
             import sys
             if not hasattr(sys, '_equity_filter_printed'):
-                print(f"[universe] PHASE 0: Equity-only filter enabled, reduced universe {n_before} → {n_after} tickers")
+                print(f"[universe] PHASE 0: Equity-only filter enabled, reduced universe {n_before} -> {n_after} tickers")
                 sys._equity_filter_printed = True
     
     # 2. ADV liquidity filter
@@ -489,6 +498,15 @@ def run_walk_forward_backtest(
     # Step through dates
     current_dates = rebalance_dates[::config.time.STEP_DAYS]
     
+    # Apply debug limit if configured
+    if config.compute.max_rebalance_dates_for_debug is not None:
+        n_limit = config.compute.max_rebalance_dates_for_debug
+        current_dates = current_dates[:n_limit]
+        if verbose:
+            print(f"\n{'='*80}")
+            print(f"[DEBUG MODE] Limited to {n_limit} rebalance date(s) for profiling")
+            print(f"{'='*80}")
+    
     if verbose:
         print(f"\nRebalance dates: {len(current_dates)}")
         print(f"Date range: {current_dates[0].date()} to {current_dates[-1].date()}")
@@ -520,12 +538,13 @@ def run_walk_forward_backtest(
     # Parallel vs Sequential Execution
     # =====================================================================
     if config.compute.parallelize_backtest:
-        # PARALLEL EXECUTION: Process rebalance dates in parallel
+        # SEQUENTIAL OUTER LOOP with PARALLEL INNER feature selection
         from joblib import Parallel, delayed
         
         if verbose:
-            print(f"\n[parallel] Processing {len(current_dates)} rebalance dates in parallel...")
-            print(f"[parallel] Using {config.compute.n_jobs} jobs")
+            print(f"\n[backtest] Processing {len(current_dates)} rebalance dates...", flush=True)
+            print(f"[backtest] Outer loop: sequential (n_jobs=1)", flush=True)
+            print(f"[backtest] Inner feature selection: parallel (n_jobs={config.compute.n_jobs})", flush=True)
         
         def process_rebalance_period(i, t0, panel_df, universe_metadata, config, model_type, portfolio_method, regime_series, verbose_inner):
             """Process a single rebalance period (for parallel execution)."""
@@ -535,8 +554,8 @@ def run_walk_forward_backtest(
             
             rebalance_start = time.time()
             if verbose_inner:
-                print(f"\n{'='*60}")
-                print(f"[{i+1}/{len(current_dates)}] Rebalance date: {t0.date()}")
+                print(f"\n{'='*60}", flush=True)
+                print(f"[{i+1}/{len(current_dates)}] Rebalance date: {t0.date()}", flush=True)
             
             # Compute Formation artifacts (v3 pipeline)
             formation_artifacts = None
@@ -548,7 +567,7 @@ def run_walk_forward_backtest(
                     universe_metadata=universe_metadata,
                     t0=t0,
                     config=config,
-                    verbose=False  # Suppress output in parallel mode
+                    verbose=verbose_inner  # Use verbose_inner to control output
                 )
                 
                 if formation_artifacts is None:
@@ -610,8 +629,6 @@ def run_walk_forward_backtest(
                 # Add Formation diagnostics if available
                 if formation_artifacts and 'formation_diagnostics' in formation_artifacts:
                     diagnostics_entry['formation_n_approved'] = formation_artifacts['formation_diagnostics']['n_approved']
-                    diagnostics_entry['formation_alpha'] = formation_artifacts['best_alpha']
-                    diagnostics_entry['formation_l1_ratio'] = formation_artifacts['best_l1_ratio']
                 
                 train_elapsed = time.time() - train_start
             except Exception as e:
@@ -749,11 +766,11 @@ def run_walk_forward_backtest(
                 'eligible_metadata': eligible_metadata
             }
         
-        # Execute in parallel
-        parallel_results = Parallel(n_jobs=config.compute.n_jobs, backend='loky')(
+        # Execute sequentially (outer loop) - inner feature selection uses max parallelism
+        parallel_results = Parallel(n_jobs=1, backend='loky')(
             delayed(process_rebalance_period)(
                 i, t0, panel_df, universe_metadata, config, model_type, 
-                portfolio_method, regime_series, False  # verbose_inner=False for parallel
+                portfolio_method, regime_series, verbose  # verbose_inner=verbose for sequential outer loop
             )
             for i, t0 in enumerate(current_dates)
         )
@@ -991,8 +1008,6 @@ def run_walk_forward_backtest(
                 # Add Formation diagnostics if available
                 if formation_artifacts and 'formation_diagnostics' in formation_artifacts:
                     diagnostics_entry['formation_n_approved'] = formation_artifacts['formation_diagnostics']['n_approved']
-                    diagnostics_entry['formation_alpha'] = formation_artifacts['best_alpha']
-                    diagnostics_entry['formation_l1_ratio'] = formation_artifacts['best_l1_ratio']
                 
                 train_elapsed = time.time() - train_start
                 total_train_time += train_elapsed

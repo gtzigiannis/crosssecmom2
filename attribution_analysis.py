@@ -1,9 +1,9 @@
 """
 Attribution Analysis Module
 ============================
-Comprehensive multi-level attribution system for cross-sectional momentum strategy.
+multi-level attribution system for cross-sectional momentum strategy.
 
-Answers key questions:
+Answers folllowing questions:
 1. Which features contributed most to performance?
 2. Which sectors/themes drove returns?
 3. How much came from longs vs shorts?

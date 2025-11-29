@@ -29,7 +29,436 @@ import warnings
 warnings.filterwarnings('ignore')
 
 from config import ResearchConfig
-from data_manager import download_etf_data, CrossSecMomDataManager  # Import from data_manager instead
+from data_manager import download_etf_data, CrossSecMomDataManager, filter_tickers_for_research_window, clean_raw_ohlcv_data  # Import from data_manager instead
+
+# ============================================================================
+# DATA VALIDATION UTILITIES
+# ============================================================================
+# These functions validate data availability EARLY to catch problems before
+# they propagate through the pipeline.
+
+
+def validate_data_availability(
+    data_dict: Dict[str, pd.DataFrame],
+    macro_data: Dict[str, pd.Series],
+    formation_start: str,
+    warmup_days: int,
+    verbose: bool = True
+) -> Dict[str, any]:
+    """
+    Validate that we have sufficient data for the formation window + warmup.
+    
+    This check runs EARLY in the pipeline to catch data availability issues
+    before they propagate and cause mysterious NaN problems downstream.
+    
+    Parameters
+    ----------
+    data_dict : Dict[str, pd.DataFrame]
+        Dictionary of ticker -> OHLCV DataFrame
+    macro_data : Dict[str, pd.Series]
+        Dictionary of macro series (vix, yields, etc.)
+    formation_start : str
+        Formation window start date (YYYY-MM-DD)
+    warmup_days : int
+        Number of warmup days needed for rolling windows
+    verbose : bool
+        Print detailed diagnostics
+        
+    Returns
+    -------
+    Dict with validation results:
+        - 'valid': bool - True if all checks pass
+        - 'ohlcv_coverage': Dict of ticker -> earliest date
+        - 'macro_coverage': Dict of macro -> earliest date
+        - 'issues': List of issue descriptions
+    """
+    import pandas as pd
+    
+    formation_start_dt = pd.to_datetime(formation_start)
+    required_start_dt = formation_start_dt - pd.Timedelta(days=warmup_days)
+    
+    results = {
+        'valid': True,
+        'ohlcv_coverage': {},
+        'macro_coverage': {},
+        'issues': [],
+        'formation_start': formation_start,
+        'required_start': required_start_dt.strftime('%Y-%m-%d'),
+        'warmup_days': warmup_days
+    }
+    
+    if verbose:
+        print(f"\n[validate] Checking data availability...")
+        print(f"[validate]   Formation start: {formation_start}")
+        print(f"[validate]   Warmup required: {warmup_days} days")
+        print(f"[validate]   Data must start by: {required_start_dt.strftime('%Y-%m-%d')}")
+    
+    # Check OHLCV data coverage
+    if verbose:
+        print(f"\n[validate] OHLCV data coverage:")
+    
+    ohlcv_issues = []
+    for ticker, df in data_dict.items():
+        if df.empty:
+            results['ohlcv_coverage'][ticker] = None
+            ohlcv_issues.append(f"{ticker}: No data")
+            continue
+        
+        earliest_date = df.index.min()
+        results['ohlcv_coverage'][ticker] = earliest_date
+        
+        if earliest_date > required_start_dt:
+            days_short = (earliest_date - required_start_dt).days
+            ohlcv_issues.append(f"{ticker}: starts {earliest_date.strftime('%Y-%m-%d')} ({days_short} days late)")
+    
+    if ohlcv_issues:
+        if verbose:
+            print(f"[validate]   ⚠ {len(ohlcv_issues)} tickers have insufficient history:")
+            for issue in ohlcv_issues[:5]:
+                print(f"[validate]     - {issue}")
+            if len(ohlcv_issues) > 5:
+                print(f"[validate]     ... and {len(ohlcv_issues) - 5} more")
+        results['issues'].extend(ohlcv_issues)
+    else:
+        if verbose:
+            print(f"[validate]   ✓ All {len(data_dict)} tickers have sufficient OHLCV history")
+    
+    # Check macro data coverage - THIS IS CRITICAL
+    if verbose:
+        print(f"\n[validate] Macro data coverage:")
+    
+    macro_issues = []
+    for name, series in macro_data.items():
+        if series is None or (hasattr(series, 'empty') and series.empty):
+            results['macro_coverage'][name] = None
+            macro_issues.append(f"{name}: No data")
+            results['valid'] = False
+            continue
+        
+        earliest_date = series.index.min()
+        results['macro_coverage'][name] = earliest_date
+        
+        if earliest_date > required_start_dt:
+            days_short = (earliest_date - required_start_dt).days
+            macro_issues.append(f"{name}: starts {earliest_date.strftime('%Y-%m-%d')} ({days_short} days late)")
+            results['valid'] = False  # Macro coverage is CRITICAL
+    
+    if macro_issues:
+        if verbose:
+            print(f"[validate]   ✗ CRITICAL: Macro data has insufficient history:")
+            for issue in macro_issues:
+                print(f"[validate]     - {issue}")
+        results['issues'].extend([f"MACRO: {i}" for i in macro_issues])
+    else:
+        if verbose:
+            print(f"[validate]   ✓ All macro data has sufficient history")
+    
+    # Summary
+    if verbose:
+        if results['valid']:
+            print(f"\n[validate] ✓ Data validation PASSED - all sources have sufficient coverage")
+        else:
+            print(f"\n[validate] ✗ Data validation FAILED - see issues above")
+            print(f"[validate]   This will cause NaN in features and dropped features!")
+    
+    return results
+
+
+def trim_panel_to_formation_window(
+    panel_df: pd.DataFrame,
+    formation_start: str,
+    formation_end: str,
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Trim panel to formation window dates only.
+    
+    After feature engineering, the panel contains warmup data that was needed
+    for rolling window calculations. This function removes those rows, keeping
+    only the formation window dates that will be used for training/testing.
+    
+    This is the final step that eliminates any remaining warmup NaN.
+    
+    Parameters
+    ----------
+    panel_df : pd.DataFrame
+        Panel with (Date, Ticker) MultiIndex or Date column
+    formation_start : str
+        Formation window start date (YYYY-MM-DD)
+    formation_end : str
+        Formation window end date (YYYY-MM-DD)
+    verbose : bool
+        Print diagnostics
+        
+    Returns
+    -------
+    pd.DataFrame
+        Panel trimmed to formation window dates
+    """
+    import pandas as pd
+    
+    formation_start_dt = pd.to_datetime(formation_start)
+    formation_end_dt = pd.to_datetime(formation_end)
+    
+    # Handle MultiIndex
+    has_multiindex = isinstance(panel_df.index, pd.MultiIndex)
+    if has_multiindex:
+        dates = panel_df.index.get_level_values('Date')
+    else:
+        dates = panel_df['Date']
+    
+    n_before = len(panel_df)
+    date_range_before = f"{dates.min()} to {dates.max()}"
+    
+    # Filter to formation window
+    mask = (dates >= formation_start_dt) & (dates <= formation_end_dt)
+    panel_trimmed = panel_df.loc[mask]
+    
+    n_after = len(panel_trimmed)
+    if has_multiindex:
+        dates_after = panel_trimmed.index.get_level_values('Date')
+    else:
+        dates_after = panel_trimmed['Date']
+    date_range_after = f"{dates_after.min()} to {dates_after.max()}"
+    
+    if verbose:
+        n_removed = n_before - n_after
+        pct_removed = n_removed / n_before * 100 if n_before > 0 else 0
+        print(f"[trim] Trimming panel to formation window...")
+        print(f"[trim]   Before: {n_before:,} rows ({date_range_before})")
+        print(f"[trim]   After:  {n_after:,} rows ({date_range_after})")
+        print(f"[trim]   Removed: {n_removed:,} warmup rows ({pct_removed:.1f}%)")
+    
+    return panel_trimmed
+
+
+# ============================================================================
+# NaN HANDLING UTILITIES
+# ============================================================================
+# These functions handle NaN at the SOURCE to ensure clean data downstream.
+# NaN handling is done WITHOUT look-ahead bias:
+# - Forward-fill with limit (no future data used)
+# - Cross-sectional median imputation (per-date, no temporal leakage)
+# - Drop features with excessive NaN (structural data issues)
+
+
+def validate_features_nan(
+    df: pd.DataFrame,
+    stage: str,
+    nan_threshold: float = 0.10,
+    drop_high_nan: bool = True,
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Validate and clean NaN in feature DataFrame AFTER a processing stage.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Feature DataFrame (may have NaN)
+    stage : str
+        Name of the processing stage (for logging)
+    nan_threshold : float
+        Maximum allowed NaN fraction per column (default 10%)
+    drop_high_nan : bool
+        If True, drop columns exceeding nan_threshold
+    verbose : bool
+        Print detailed diagnostics
+        
+    Returns
+    -------
+    pd.DataFrame
+        Cleaned DataFrame with high-NaN columns dropped
+    """
+    if df.empty:
+        return df
+    
+    n_rows = len(df)
+    n_cols_start = len(df.columns)
+    
+    # Calculate NaN percentage per column (excluding non-feature columns)
+    exclude_cols = {'Ticker', 'Date'}
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
+    
+    nan_pct = df[feature_cols].isna().sum() / n_rows
+    high_nan_cols = nan_pct[nan_pct > nan_threshold].index.tolist()
+    
+    if verbose and high_nan_cols:
+        print(f"  [{stage}] Found {len(high_nan_cols)} features with >{nan_threshold:.0%} NaN:", flush=True)
+        # Show top 5 worst offenders
+        worst = nan_pct[high_nan_cols].sort_values(ascending=False).head(5)
+        for col, pct in worst.items():
+            print(f"    - {col}: {pct:.1%} NaN", flush=True)
+        if len(high_nan_cols) > 5:
+            print(f"    ... and {len(high_nan_cols) - 5} more", flush=True)
+    
+    if drop_high_nan and high_nan_cols:
+        df = df.drop(columns=high_nan_cols)
+        if verbose:
+            print(f"  [{stage}] Dropped {len(high_nan_cols)} high-NaN features, {len(df.columns)} remain", flush=True)
+    
+    return df
+
+
+def impute_nan_cross_sectional(
+    panel_df: pd.DataFrame,
+    feature_cols: list,
+    verbose: bool = True
+) -> pd.DataFrame:
+    """
+    Impute remaining NaN using cross-sectional median (per date).
+    
+    This method is SAFE from look-ahead bias because:
+    - For each date, we only use data from that same date
+    - No future information is used
+    - No zero imputation (which would mess up returns)
+    
+    Two-pass approach:
+    1. First pass: Impute with same-date cross-sectional median
+    2. Second pass: For dates where ALL tickers had NaN (warmup period),
+       forward-fill from the first available cross-sectional median
+       (still safe - uses only past data)
+    
+    Parameters
+    ----------
+    panel_df : pd.DataFrame
+        Panel data with 'Date' column or MultiIndex
+    feature_cols : list
+        List of feature columns to impute
+    verbose : bool
+        Print diagnostics
+        
+    Returns
+    -------
+    pd.DataFrame
+        Panel with NaN imputed
+    """
+    if panel_df.empty:
+        return panel_df
+    
+    # Work with reset index for easier groupby
+    has_multiindex = isinstance(panel_df.index, pd.MultiIndex)
+    if has_multiindex:
+        df = panel_df.reset_index()
+    else:
+        df = panel_df.copy()
+    
+    # Count NaN before imputation
+    nan_before = df[feature_cols].isna().sum().sum()
+    
+    if nan_before == 0:
+        if verbose:
+            print(f"  [impute] No NaN to impute", flush=True)
+        return panel_df
+    
+    # PASS 1: Impute with same-date cross-sectional median
+    for col in feature_cols:
+        if col not in df.columns:
+            continue
+        
+        # Check if column has NaN
+        if df[col].isna().any():
+            # Group by date and fill NaN with median of that date
+            df[col] = df.groupby('Date')[col].transform(
+                lambda x: x.fillna(x.median())
+            )
+    
+    # Count NaN after pass 1
+    nan_after_pass1 = df[feature_cols].isna().sum().sum()
+    
+    if verbose:
+        n_imputed_pass1 = nan_before - nan_after_pass1
+        print(f"  [impute] Pass 1: Imputed {n_imputed_pass1:,} NaN with same-date cross-sectional median", flush=True)
+    
+    # PASS 2: Handle dates where ALL tickers had NaN (warmup period)
+    # Forward-fill ONLY (safe - uses past data only)
+    # NO BFILL - that would cause look-ahead bias!
+    if nan_after_pass1 > 0:
+        # For each feature with remaining NaN, try forward-fill per ticker
+        # This handles warmup period NaN where all tickers had NaN on early dates
+        for col in feature_cols:
+            if col not in df.columns:
+                continue
+            
+            if df[col].isna().any():
+                # Forward-fill within each ticker (safe - uses past data only)
+                df[col] = df.groupby('Ticker')[col].ffill()
+                
+                # NOTE: We do NOT use bfill() - that would cause look-ahead bias!
+                # Any remaining NaN after ffill will be at the START of the time series
+                # These will be trimmed when we filter to formation window dates
+    
+    # Count NaN after pass 2
+    nan_after = df[feature_cols].isna().sum().sum()
+    
+    if verbose:
+        if nan_after_pass1 > nan_after:
+            n_imputed_pass2 = nan_after_pass1 - nan_after
+            print(f"  [impute] Pass 2: Imputed {n_imputed_pass2:,} NaN with forward-fill only (no bfill - safe)", flush=True)
+        if nan_after > 0:
+            # Show which columns still have NaN
+            nan_cols = df[feature_cols].isna().sum()
+            nan_cols = nan_cols[nan_cols > 0].sort_values(ascending=False)
+            print(f"  [impute] INFO: {nan_after:,} NaN remain in {len(nan_cols)} columns (warmup period)", flush=True)
+            print(f"  [impute] These will be removed when trimming to formation window", flush=True)
+            for col, cnt in nan_cols.head(5).items():
+                print(f"           - {col}: {cnt:,} NaN", flush=True)
+            if len(nan_cols) > 5:
+                print(f"           ... and {len(nan_cols) - 5} more", flush=True)
+    
+    # Restore index
+    if has_multiindex:
+        df = df.set_index(['Date', 'Ticker'])
+    
+    return df
+
+
+def final_nan_check(panel_df: pd.DataFrame, stage: str = "final") -> bool:
+    """
+    Final NaN check - returns True if data is clean, False if NaN exist.
+    
+    This is called at the END of feature engineering to ensure clean output.
+    If NaN exist, feature selection will FAIL with a clear error message.
+    
+    Parameters
+    ----------
+    panel_df : pd.DataFrame
+        Final panel data
+    stage : str
+        Stage name for logging
+        
+    Returns
+    -------
+    bool
+        True if no NaN exist, False otherwise
+    """
+    if panel_df.empty:
+        return True
+    
+    # Exclude non-feature columns from check
+    exclude_cols = {'Ticker', 'Date', 'Close', 'ADV_63', 'ADV_63_Rank'}
+    exclude_cols.update([c for c in panel_df.columns if c.startswith('FwdRet')])
+    
+    feature_cols = [c for c in panel_df.columns if c not in exclude_cols]
+    
+    nan_count = panel_df[feature_cols].isna().sum().sum()
+    total_cells = len(panel_df) * len(feature_cols)
+    
+    if nan_count > 0:
+        nan_pct = nan_count / total_cells * 100
+        print(f"\n[{stage}] ERROR: {nan_count:,} NaN values remain ({nan_pct:.2f}% of feature data)", flush=True)
+        
+        # Show which columns have NaN
+        nan_by_col = panel_df[feature_cols].isna().sum()
+        cols_with_nan = nan_by_col[nan_by_col > 0].sort_values(ascending=False)
+        print(f"[{stage}] Columns with NaN:", flush=True)
+        for col, count in cols_with_nan.head(10).items():
+            print(f"    - {col}: {count:,} NaN", flush=True)
+        
+        return False
+    
+    print(f"[{stage}] ✓ Data is clean - no NaN in {len(feature_cols)} feature columns", flush=True)
+    return True
 
 # ============================================================================
 # NUMBA-ACCELERATED FUNCTIONS
@@ -272,20 +701,30 @@ def shock_features(returns, vol_60d):
 # PER-TICKER FEATURE ENGINEERING
 # ============================================================================
 
-def process_ticker(ticker: str, data: pd.DataFrame, adv_window: int = 63) -> pd.DataFrame:
+def process_ticker(
+    ticker: str, 
+    data: pd.DataFrame, 
+    adv_window: int = 63,
+    config: 'ResearchConfig' = None
+) -> pd.DataFrame:
     """
     Engineer features for a single ticker.
     
-    CRITICAL FIX: Returns Close column in the features dict!
+    NOTE: Raw OHLCV data should already be cleaned by clean_raw_ohlcv_data()
+    in data_manager.py BEFORE calling this function. This function only:
+    - Computes features from the cleaned data
+    - Replaces Inf with NaN (will be handled in panel-level cleaning)
     
     Parameters
     ----------
     ticker : str
         Ticker symbol
     data : pd.DataFrame
-        Raw OHLCV data with DatetimeIndex
+        Cleaned OHLCV data with DatetimeIndex (already forward-filled)
     adv_window : int
         Window for ADV calculation (default: 63)
+    config : ResearchConfig, optional
+        Configuration with NaN handling parameters (not used here anymore)
         
     Returns
     -------
@@ -293,13 +732,17 @@ def process_ticker(ticker: str, data: pd.DataFrame, adv_window: int = 63) -> pd.
         Features with DatetimeIndex and 'Ticker' column
     """
     try:
+        # Data should already be cleaned - just check if empty
+        if data.empty:
+            return pd.DataFrame()
+        
         close = data['Close'].astype('float32')
         close.name = 'Close'
         
         # CRITICAL: Include Close in output
         feats = {
             'Ticker': ticker,
-            'Close': close,  # <-- FIX: Was missing!
+            'Close': close,
         }
         
         # Returns-based series
@@ -359,6 +802,12 @@ def process_ticker(ticker: str, data: pd.DataFrame, adv_window: int = 63) -> pd.
         # Convert numeric columns to float32, keep Ticker as string
         numeric_cols = df.select_dtypes(include=['number']).columns
         df[numeric_cols] = df[numeric_cols].astype('float32')
+        
+        # =====================================================================
+        # STEP 2: Handle Inf values from calculations (e.g., division by zero)
+        # =====================================================================
+        # Replace Inf/-Inf with NaN (will be handled in later cleaning steps)
+        df = df.replace([np.inf, -np.inf], np.nan)
         
         return df
         
@@ -1163,27 +1612,103 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     # all 4 criteria, allowing new ETFs to enter over time.
     # ========================================================
     
-    print("\n[2/8] Downloading OHLCV data...")
-    print(f"[download] All ETFs will be downloaded from {config.time.start_date} to {config.time.end_date}")
-    print(f"[download] Filtering will be applied during walk-forward backtest")
+    print("\n[2/10] Downloading OHLCV data...")
+    
+    # Calculate warmup days needed for ALL features to be valid at formation_start
+    # Two components:
+    # 1. FEATURE LOOKBACK: Longest lookback in pct_change features (e.g., Close%-252)
+    # 2. ROLLING WINDOW WARMUP: Longest rolling window (e.g., RSI, Bollinger, etc.)
+    # 
+    # Close%-252 = (Close / Close.shift(252) - 1) * 100
+    # This needs 252 PRIOR days of data to produce the FIRST valid value.
+    # Then we need additional days for rolling windows on top of that.
+    feature_max_lookback = 252  # Close%-252 is the longest lookback feature
+    rolling_window_warmup = 63  # Longest rolling windows (std63, BollUp50, etc.)
+    safety_buffer = 21  # Extra safety margin
+    
+    # Total warmup = feature lookback + rolling warmup + buffer
+    warmup_days = feature_max_lookback + rolling_window_warmup + safety_buffer
+    
+    # Calculate extended download start to include full warmup period
+    # Use 1.5x multiplier to convert trading days to calendar days
+    download_start_dt = pd.to_datetime(config.time.start_date) - pd.Timedelta(days=int(warmup_days * 1.5))
+    download_start_str = download_start_dt.strftime('%Y-%m-%d')
+    
+    print(f"[download] Step 1: Download ALL tickers with extended range for warmup")
+    print(f"[download]   Formation start: {config.time.start_date}")
+    print(f"[download]   Feature max lookback: {feature_max_lookback} trading days (Close%-252)")
+    print(f"[download]   Rolling window warmup: {rolling_window_warmup} trading days")
+    print(f"[download]   Total warmup needed: {warmup_days} trading days")
+    print(f"[download]   Download start (extended): {download_start_str}")
+    print(f"[download]   Download end: {config.time.end_date}")
     
     download_start = time.time()
-    data_dict = download_etf_data(
+    data_dict_raw = download_etf_data(
         tickers,
-        config.time.start_date,
+        download_start_str,  # Extended start to include warmup
         config.time.end_date
     )
     download_elapsed = time.time() - download_start
     
-    if len(data_dict) == 0:
+    if len(data_dict_raw) == 0:
         raise RuntimeError("No data downloaded!")
     
+    n_downloaded = len(data_dict_raw)
+    print(f"[download] Downloaded: {n_downloaded} tickers")
     print(f"[time] Data download completed in {download_elapsed:.2f} seconds ({download_elapsed/60:.2f} minutes)")
     
     # -------------------------------------------------------------------------
-    # 2.5. Download macro data (NEW)
+    # 2.1 STEP 2: Filter tickers based on formation window start date
     # -------------------------------------------------------------------------
-    print("\n[2.5/8] Downloading macro data...")
+    # ETFs that were not listed at the formation window start date are dropped.
+    # This preserves ETFs that have trading history after our formation start,
+    # even if they were listed later than the download start date.
+    print("\n[2.1/10] Filtering tickers for research window...")
+    
+    # Use same warmup_days as calculated for download
+    data_dict_filtered = filter_tickers_for_research_window(
+        data_dict_raw,
+        formation_start_date=config.time.start_date,
+        warmup_days=warmup_days,  # Already defined above
+        verbose=True
+    )
+    
+    n_after_filter = len(data_dict_filtered)
+    n_dropped = n_downloaded - n_after_filter
+    print(f"[filter] Result: {n_after_filter} tickers kept, {n_dropped} dropped")
+    
+    # -------------------------------------------------------------------------
+    # 2.2 STEP 3: Clean raw OHLCV data (forward-fill gaps, no look-ahead)
+    # -------------------------------------------------------------------------
+    print("\n[2.2/10] Cleaning raw OHLCV data...")
+    
+    data_dict = clean_raw_ohlcv_data(
+        data_dict_filtered,
+        ffill_limit=config.features.raw_data_ffill_limit,
+        verbose=True
+    )
+    
+    # Validate that cleaned data has no NaN in Close column
+    tickers_with_nan_close = []
+    for ticker, df in data_dict.items():
+        if 'Close' in df.columns and df['Close'].isna().any():
+            tickers_with_nan_close.append(ticker)
+    
+    if tickers_with_nan_close:
+        print(f"[warning] {len(tickers_with_nan_close)} tickers still have NaN in Close after cleaning")
+        print(f"[warning] These will be handled during feature imputation")
+    else:
+        print(f"[clean] ✓ All {len(data_dict)} tickers have clean Close data")
+    
+    print(f"\n[data] Summary after Steps 1-3:")
+    print(f"       - Downloaded from yfinance: {n_downloaded} tickers")
+    print(f"       - After formation window filter: {n_after_filter} tickers")
+    print(f"       - Ready for feature engineering: {len(data_dict)} tickers")
+    
+    # -------------------------------------------------------------------------
+    # 3. Download macro data (WITH EXTENDED RANGE for warmup)
+    # -------------------------------------------------------------------------
+    print("\n[3/10] Downloading macro data...")
     macro_start = time.time()
     data_manager = CrossSecMomDataManager(config.paths.data_dir)
     macro_tickers = {
@@ -1193,31 +1718,58 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
         'tbill_3m': '^IRX',    # 3-month T-bill rate (same proxy)
     }
     
+    # CRITICAL: Use extended download start (same as OHLCV) to avoid NaN
+    # VIX z-score needs 252 days of rolling history!
+    print(f"[macro] Using extended start date for macro data: {download_start_str}")
+    print(f"[macro] This ensures VIX z-score (252-day rolling) has valid data")
+    
     macro_data = data_manager.load_or_download_macro_data(
         macro_tickers,
-        start_date=config.time.start_date,
+        start_date=download_start_str,  # Use extended start, NOT config.time.start_date
         end_date=config.time.end_date
     )
     macro_elapsed = time.time() - macro_start
     print(f"[time] Macro data download completed in {macro_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
-    # 3. Feature engineering (parallel)
+    # 3.1 VALIDATE DATA AVAILABILITY (EARLY CHECK)
     # -------------------------------------------------------------------------
-    print("\n[3/8] Engineering features per ticker...")
+    print("\n[3.1/10] Validating data availability...")
+    validation_results = validate_data_availability(
+        data_dict=data_dict,
+        macro_data=macro_data,
+        formation_start=config.time.start_date,
+        warmup_days=warmup_days,
+        verbose=True
+    )
+    
+    if not validation_results['valid']:
+        print("\n" + "="*80)
+        print("WARNING: Data validation detected issues!")
+        print("="*80)
+        print("Some data sources do not have sufficient history for warmup period.")
+        print("This may cause NaN in features. Review issues above.")
+        print("Continuing anyway, but features may be dropped due to NaN.")
+        print("="*80 + "\n")
+    
+    # -------------------------------------------------------------------------
+    # 4. Feature engineering (parallel) - STEP 4: Compute features
+    # -------------------------------------------------------------------------
+    print("\n[4/10] Engineering features per ticker...")
+    print(f"[features] Computing technical and statistical transformations...")
     
     feature_eng_start = time.time()
     results = Parallel(n_jobs=config.compute.n_jobs, backend='threading', verbose=5)(
-        delayed(process_ticker)(ticker, data_dict[ticker], config.universe.adv_window)
+        delayed(process_ticker)(ticker, data_dict[ticker], config.universe.adv_window, config)
         for ticker in data_dict.keys()
     )
     feature_eng_elapsed = time.time() - feature_eng_start
     print(f"[time] Feature engineering completed in {feature_eng_elapsed:.2f} seconds ({feature_eng_elapsed/60:.2f} minutes)")
     
     # -------------------------------------------------------------------------
-    # 4. Combine into panel structure
+    # 5. Combine into panel structure
     # -------------------------------------------------------------------------
-    print("\n[4/8] Building panel structure...")
+    print("\n[5/10] Building panel structure...")
     
     panel_list = []
     for ticker, feat_df in zip(data_dict.keys(), results):
@@ -1239,9 +1791,25 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     print(f"Unique tickers: {panel_df.index.get_level_values('Ticker').nunique()}")
     
     # -------------------------------------------------------------------------
-    # 5. Add forward returns
+    # STEP 4 CHECK: Validate NaN after feature computation
     # -------------------------------------------------------------------------
-    print("\n[5/8] Computing forward returns...")
+    print("\n[check] Step 4 validation: NaN after feature computation...")
+    panel_df_reset = panel_df.reset_index()
+    exclude_check = {'Ticker', 'Date', 'Close'}
+    exclude_check.update([c for c in panel_df.columns if c.startswith('FwdRet')])
+    feature_cols_check = [c for c in panel_df.columns if c not in exclude_check]
+    
+    nan_after_features = panel_df[feature_cols_check].isna().sum().sum()
+    total_cells = len(panel_df) * len(feature_cols_check)
+    nan_pct = nan_after_features / total_cells * 100
+    print(f"[check]   Features: {len(feature_cols_check)}")
+    print(f"[check]   NaN cells: {nan_after_features:,} / {total_cells:,} ({nan_pct:.2f}%)")
+    print(f"[check]   This NaN is expected from rolling windows (warmup period)")
+    
+    # -------------------------------------------------------------------------
+    # 6. Add forward returns
+    # -------------------------------------------------------------------------
+    print("\n[6/10] Computing forward returns...")
     fwd_ret_start = time.time()
     panel_df = panel_df.reset_index()
     panel_df = add_forward_returns(panel_df, config.time.HOLDING_PERIOD_DAYS, config)
@@ -1249,48 +1817,125 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     print(f"[time] Forward returns computed in {fwd_ret_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
-    # 6. Add cross-sectional features (NEW from crosssecmom)
+    # 7. Add cross-sectional features
     # -------------------------------------------------------------------------
-    print("\n[6/8] Adding relative return features...")
+    print("\n[7/10] Adding relative return features...")
     rel_ret_start = time.time()
     panel_df = add_relative_return_features(panel_df, lookbacks=[5, 20, 60])
     rel_ret_elapsed = time.time() - rel_ret_start
     print(f"[time] Relative return features added in {rel_ret_elapsed:.2f} seconds")
     
-    print("\n[7/8] Adding correlation features...")
+    print("\n[7.1/10] Adding correlation features...")
     corr_start = time.time()
     panel_df = add_correlation_features(panel_df, window=20)
     corr_elapsed = time.time() - corr_start
     print(f"[time] Correlation features added in {corr_elapsed:.2f} seconds")
     
-    print("\n[7.5/8] Adding asset type flags...")
+    print("\n[7.2/10] Adding asset type flags...")
     asset_start = time.time()
     panel_df = add_asset_type_flags(panel_df, config)
     asset_elapsed = time.time() - asset_start
     print(f"[time] Asset type flags added in {asset_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
-    # 7.6. Add macro features (NEW)
+    # 7.3. Add macro features
     # -------------------------------------------------------------------------
-    print("\n[7.6/8] Adding macro/regime features...")
+    print("\n[7.3/10] Adding macro/regime features...")
     macro_feat_start = time.time()
     panel_df = add_macro_features(panel_df, macro_data, config)
     macro_feat_elapsed = time.time() - macro_feat_start
     print(f"[time] Macro features added in {macro_feat_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
-    # 7.7. PHASE 1: Generate exhaustive interaction features
+    # 8. Generate interaction features
     # -------------------------------------------------------------------------
-    print("\n[7.7/9] PHASE 1: Generating exhaustive interaction features...")
+    print("\n[8/10] Generating exhaustive interaction features...")
     interaction_start = time.time()
     panel_df = generate_interaction_features(panel_df, config)
     interaction_elapsed = time.time() - interaction_start
     print(f"[time] Interaction features added in {interaction_elapsed:.2f} seconds")
     
     # -------------------------------------------------------------------------
-    # 8. Add ADV rank for filtering
+    # STEP 4 FINAL CHECK: Validate NaN after ALL feature computations
     # -------------------------------------------------------------------------
-    print("\n[8/9] Adding ADV cross-sectional rank...")
+    print("\n[check] Step 4 validation: NaN after ALL feature computations (incl. interactions)...")
+    exclude_cols = {'Ticker', 'Date', 'Close', 'ADV_63', 'ADV_63_Rank'}
+    exclude_cols.update([c for c in panel_df.columns if c.startswith('FwdRet')])
+    feature_cols_all = [c for c in panel_df.columns if c not in exclude_cols]
+    
+    nan_after_all = panel_df[feature_cols_all].isna().sum().sum()
+    total_cells_all = len(panel_df) * len(feature_cols_all)
+    nan_pct_all = nan_after_all / total_cells_all * 100
+    print(f"[check]   Total features (incl. interactions): {len(feature_cols_all)}")
+    print(f"[check]   NaN cells: {nan_after_all:,} / {total_cells_all:,} ({nan_pct_all:.2f}%)")
+    
+    # -------------------------------------------------------------------------
+    # 9. TRIM PANEL TO FORMATION WINDOW FIRST (before NaN threshold check)
+    # -------------------------------------------------------------------------
+    # CRITICAL: The warmup period has EXPECTED NaN values (Close%-252 needs 252 days).
+    # We must trim to formation window FIRST, then check NaN thresholds.
+    # Otherwise we incorrectly drop features that have valid data in formation window.
+    print("\n[9/10] Trimming panel to formation window FIRST (before NaN check)...")
+    rows_before_trim = len(panel_df)
+    panel_df = trim_panel_to_formation_window(
+        panel_df,
+        formation_start=config.time.start_date,
+        formation_end=config.time.end_date,
+        verbose=True
+    )
+    rows_after_trim = len(panel_df)
+    print(f"[trim] Warmup rows removed: {rows_before_trim - rows_after_trim:,}")
+    
+    # -------------------------------------------------------------------------
+    # 9.1 NaN CLEANING: Drop high-NaN features, impute remaining (STEP 5)
+    # -------------------------------------------------------------------------
+    # Now that warmup rows are removed, NaN % reflects actual formation window quality
+    print("\n[9.1/10] Step 5: NaN cleaning - drop >10% NaN features, impute rest...")
+    nan_threshold = config.features.feature_nan_threshold
+    
+    n_features_before = len(feature_cols_all)
+    nan_before_total = panel_df[feature_cols_all].isna().sum().sum()
+    
+    # Drop high-NaN features (>10% NaN in formation window = structural data issues)
+    nan_pct_by_col = panel_df[feature_cols_all].isna().sum() / len(panel_df)
+    high_nan_features = nan_pct_by_col[nan_pct_by_col > nan_threshold].index.tolist()
+    
+    if high_nan_features:
+        print(f"[nan] Dropping {len(high_nan_features)} features with >{nan_threshold:.0%} NaN in formation window:", flush=True)
+        # Show top 10 worst offenders
+        worst = nan_pct_by_col[high_nan_features].sort_values(ascending=False).head(10)
+        for col, pct in worst.items():
+            print(f"    - {col}: {pct:.1%} NaN", flush=True)
+        if len(high_nan_features) > 10:
+            print(f"    ... and {len(high_nan_features) - 10} more", flush=True)
+        
+        panel_df = panel_df.drop(columns=high_nan_features)
+    else:
+        print(f"[nan] ✓ No features with >{nan_threshold:.0%} NaN in formation window!")
+    
+    # Update feature list after dropping
+    feature_cols = [c for c in feature_cols_all if c not in high_nan_features]
+    n_features_after_drop = len(feature_cols)
+    
+    # Impute remaining NaN with cross-sectional median (innocent NaN from rolling windows)
+    if config.features.enable_nan_imputation:
+        print(f"[nan] Imputing remaining NaN with cross-sectional median (no look-ahead)...")
+        panel_df = impute_nan_cross_sectional(panel_df, feature_cols, verbose=True)
+    
+    # Count NaN after cleaning
+    nan_after_total = panel_df[feature_cols].isna().sum().sum()
+    
+    print(f"\n[nan] Feature NaN summary (Step 5):")
+    print(f"    - Features before cleaning: {n_features_before}")
+    print(f"    - Features dropped (>{nan_threshold:.0%} NaN in formation): {len(high_nan_features)}")
+    print(f"    - Features remaining: {n_features_after_drop}")
+    print(f"    - NaN before imputation: {nan_before_total:,}")
+    print(f"    - NaN after imputation: {nan_after_total:,}")
+    
+    # -------------------------------------------------------------------------
+    # 9.2 Add ADV rank for filtering
+    # -------------------------------------------------------------------------
+    print("\n[9.2/10] Adding ADV cross-sectional rank...")
     adv_col = f'ADV_{config.universe.adv_window}'
     panel_df = add_adv_rank(panel_df, adv_col)
     
@@ -1298,9 +1943,31 @@ def run_feature_engineering(config: ResearchConfig) -> pd.DataFrame:
     panel_df = panel_df.set_index(['Date', 'Ticker']).sort_index()
     
     # -------------------------------------------------------------------------
-    # 9. Save outputs
+    # STEP 5 CHECK: Final NaN validation before delivery to feature selection
     # -------------------------------------------------------------------------
-    print("\n[9/9] Saving outputs...")
+    print("\n[check] Step 5 validation: Final NaN check before delivery to feature_selection...")
+    is_clean = final_nan_check(panel_df, stage="final")
+    
+    if is_clean:
+        print(f"[check] ✓ Panel is NaN-free and ready for feature selection!")
+    else:
+        # This should never happen if our NaN handling is correct
+        # But if it does, we fail loudly so the user knows to fix feature_engineering
+        raise ValueError(
+            "\n" + "="*80 + "\n"
+            "FEATURE ENGINEERING FAILED: NaN values remain in output data!\n"
+            "\n"
+            "This indicates a bug in the NaN handling logic. Feature selection\n"
+            "CANNOT proceed with NaN data (ElasticNet will produce zero coefficients).\n"
+            "\n"
+            "Please review the NaN cleaning steps above and fix the source of NaN.\n"
+            + "="*80
+        )
+    
+    # -------------------------------------------------------------------------
+    # 10. Save outputs (STEP 6)
+    # -------------------------------------------------------------------------
+    print("\n[10/10] Step 6: Saving clean panel to disk...")
     
     # Ensure output directory exists
     os.makedirs(os.path.dirname(config.paths.panel_parquet), exist_ok=True)
