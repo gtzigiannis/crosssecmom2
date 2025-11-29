@@ -1084,6 +1084,417 @@ def compute_structure_features(
 
 
 # ============================================================================
+# RISK / BETA / CORRELATION FEATURES
+# ============================================================================
+
+def compute_risk_beta_features(
+    returns: pd.Series,
+    market_returns: pd.Series,
+    close: pd.Series,
+) -> Dict[str, pd.Series]:
+    """
+    Compute risk, beta, and correlation structure features.
+    
+    Features (25+ total):
+    - Rolling beta to market (SPY) at 63, 126, 252 days
+    - Beta stability
+    - Idiosyncratic volatility and ratio
+    - Semi-volatility (downside only)
+    - Max drawdown at multiple horizons
+    - Days since peak
+    - VaR and CVaR (5%)
+    - Return skewness and kurtosis
+    - Correlation with market
+    - Downside correlation and correlation asymmetry
+    
+    Parameters
+    ----------
+    returns : pd.Series
+        Daily log returns for the asset
+    market_returns : pd.Series
+        Daily log returns for the market (SPY)
+    close : pd.Series
+        Close price series for drawdown calculations
+        
+    Returns
+    -------
+    Dict[str, pd.Series]
+        Dictionary of feature name -> Series
+    """
+    feats = {}
+    
+    if market_returns is None or market_returns.empty:
+        return feats
+    
+    # Align returns
+    aligned = pd.DataFrame({'asset': returns, 'market': market_returns}).dropna()
+    if len(aligned) < 63:
+        return feats
+    
+    asset_ret = aligned['asset']
+    mkt_ret = aligned['market']
+    
+    # ---- Rolling Beta ----
+    for window in [63, 126, 252]:
+        cov = asset_ret.rolling(window, min_periods=window//2).cov(mkt_ret)
+        var_mkt = mkt_ret.rolling(window, min_periods=window//2).var()
+        beta = cov / (var_mkt + 1e-10)
+        feats[f'beta_mkt_{window}'] = beta.reindex(returns.index).astype('float32')
+    
+    # ---- Beta Stability ----
+    beta_63 = feats.get('beta_mkt_63', pd.Series(index=returns.index, dtype='float32'))
+    feats['beta_stability_126'] = beta_63.rolling(126, min_periods=63).std().astype('float32')
+    
+    # ---- Idiosyncratic Volatility ----
+    for window in [63, 126]:
+        beta = feats.get(f'beta_mkt_{window}', pd.Series(index=returns.index, dtype='float32'))
+        residuals = returns - beta * market_returns.reindex(returns.index)
+        idio_vol = residuals.rolling(window, min_periods=window//2).std()
+        feats[f'idio_vol_{window}'] = idio_vol.astype('float32')
+    
+    # ---- Idiosyncratic Ratio ----
+    total_vol = returns.rolling(63, min_periods=30).std()
+    idio_vol_63 = feats.get('idio_vol_63', pd.Series(index=returns.index, dtype='float32'))
+    feats['idio_ratio_63'] = (idio_vol_63 / (total_vol + 1e-8)).astype('float32')
+    
+    # ---- Semi-Volatility (Downside Only) ----
+    for window in [63, 126]:
+        neg_returns = returns.where(returns < 0, 0)
+        semi_vol = neg_returns.rolling(window, min_periods=window//2).std()
+        feats[f'semi_vol_{window}'] = semi_vol.astype('float32')
+    
+    # ---- Max Drawdown ----
+    for window in [63, 126, 252]:
+        rolling_max = close.rolling(window, min_periods=window//2).max()
+        drawdown = (close - rolling_max) / rolling_max
+        max_dd = drawdown.rolling(window, min_periods=window//2).min()
+        feats[f'max_dd_{window}'] = max_dd.astype('float32')
+    
+    # ---- Days Since Peak ----
+    is_at_max = close == close.expanding().max()
+    days_since_peak = (~is_at_max).astype(int).groupby(is_at_max.cumsum()).cumsum()
+    feats['days_since_peak'] = days_since_peak.astype('float32')
+    
+    # ---- VaR and CVaR ----
+    for window in [63, 126]:
+        var_5pct = returns.rolling(window, min_periods=window//2).quantile(0.05)
+        feats[f'var_5pct_{window}'] = var_5pct.astype('float32')
+        
+        # CVaR = mean of returns below VaR
+        def cvar_func(x):
+            var = np.percentile(x, 5)
+            return x[x <= var].mean() if len(x[x <= var]) > 0 else var
+        
+        cvar = returns.rolling(window, min_periods=window//2).apply(cvar_func, raw=True)
+        feats[f'cvar_5pct_{window}'] = cvar.astype('float32')
+    
+    # ---- Return Skewness and Kurtosis ----
+    for window in [63, 126]:
+        feats[f'return_skew_{window}'] = returns.rolling(window, min_periods=window//2).skew().astype('float32')
+        feats[f'return_kurt_{window}'] = returns.rolling(window, min_periods=window//2).kurt().astype('float32')
+    
+    # ---- Correlation with Market ----
+    for window in [63, 126, 252]:
+        corr = asset_ret.rolling(window, min_periods=window//2).corr(mkt_ret)
+        feats[f'corr_mkt_{window}'] = corr.reindex(returns.index).astype('float32')
+    
+    # ---- Downside Correlation ----
+    for window in [63, 126]:
+        down_days = mkt_ret < 0
+        asset_down = asset_ret.where(down_days)
+        mkt_down = mkt_ret.where(down_days)
+        down_corr = asset_down.rolling(window, min_periods=window//4).corr(mkt_down)
+        feats[f'down_corr_{window}'] = down_corr.reindex(returns.index).astype('float32')
+    
+    # ---- Correlation Asymmetry ----
+    up_days = mkt_ret > 0
+    asset_up = asset_ret.where(up_days)
+    mkt_up = mkt_ret.where(up_days)
+    up_corr = asset_up.rolling(63, min_periods=15).corr(mkt_up)
+    down_corr_63 = feats.get('down_corr_63', pd.Series(index=returns.index, dtype='float32'))
+    feats['corr_asymmetry_63'] = (down_corr_63 - up_corr.reindex(returns.index)).astype('float32')
+    
+    return feats
+
+
+# ============================================================================
+# CROSS-ASSET RELATIVE STRENGTH FEATURES
+# ============================================================================
+
+def compute_cross_asset_features(
+    returns: pd.Series,
+    benchmark_returns: Dict[str, pd.Series],
+) -> Dict[str, pd.Series]:
+    """
+    Compute cross-asset relative strength features.
+    
+    Parameters
+    ----------
+    returns : pd.Series
+        Daily log returns for the asset
+    benchmark_returns : Dict[str, pd.Series]
+        Dictionary of benchmark returns:
+        - 'spy': S&P 500 returns (equity market)
+        - 'tlt': Long-term treasury returns (bonds)
+        - 'gld': Gold returns (safe haven)
+        
+    Returns
+    -------
+    Dict[str, pd.Series]
+        Dictionary of feature name -> Series
+    """
+    feats = {}
+    
+    for bm_name, bm_returns in benchmark_returns.items():
+        if bm_returns is None or bm_returns.empty:
+            continue
+        
+        # Align
+        aligned = pd.DataFrame({'asset': returns, 'benchmark': bm_returns}).dropna()
+        if len(aligned) < 21:
+            continue
+        
+        asset_ret = aligned['asset']
+        bm_ret = aligned['benchmark']
+        
+        # ---- Relative Strength ----
+        for window in [21, 63, 126]:
+            asset_cum = asset_ret.rolling(window, min_periods=window//2).sum()
+            bm_cum = bm_ret.rolling(window, min_periods=window//2).sum()
+            rel_strength = asset_cum - bm_cum
+            feats[f'rel_strength_{bm_name}_{window}'] = rel_strength.reindex(returns.index).astype('float32')
+        
+        # ---- Relative Strength Z-Score ----
+        rel_str_63 = feats.get(f'rel_strength_{bm_name}_63')
+        if rel_str_63 is not None:
+            rs_zscore = (rel_str_63 - rel_str_63.rolling(252, min_periods=126).mean()) / (
+                rel_str_63.rolling(252, min_periods=126).std() + 1e-8
+            )
+            feats[f'rel_strength_{bm_name}_zscore'] = rs_zscore.astype('float32')
+        
+        # ---- Rolling Correlation ----
+        for window in [63, 126]:
+            corr = asset_ret.rolling(window, min_periods=window//2).corr(bm_ret)
+            feats[f'corr_{bm_name}_{window}'] = corr.reindex(returns.index).astype('float32')
+    
+    return feats
+
+
+# ============================================================================
+# MACRO / SENTIMENT FEATURES FROM FRED
+# ============================================================================
+
+def compute_macro_features_from_fred(
+    date_index: pd.DatetimeIndex,
+    fred_data: Dict[str, pd.Series],
+) -> Dict[str, pd.Series]:
+    """
+    Compute macro/regime features from FRED data.
+    
+    Features:
+    - Yield curve slope and momentum
+    - Credit spreads and changes
+    - Financial conditions indices
+    - Sentiment indicators
+    - Economic uncertainty
+    
+    Parameters
+    ----------
+    date_index : pd.DatetimeIndex
+        Date index to align FRED data to (typically from ETF prices)
+    fred_data : Dict[str, pd.Series]
+        Dictionary of FRED series from load_or_download_fred_data()
+        Keys: tsy_2y, tsy_10y, tsy_30y, yc_slope_10_2, ig_spread, hy_spread,
+              breakeven_10y, chicago_fci, stl_fsi, umich_sentiment, epu_daily,
+              initial_claims
+        
+    Returns
+    -------
+    Dict[str, pd.Series]
+        Dictionary of macro feature name -> Series
+    """
+    feats = {}
+    
+    # ---- Yield Curve Features ----
+    if 'tsy_10y' in fred_data and 'tsy_2y' in fred_data:
+        tsy_10y = fred_data['tsy_10y'].reindex(date_index, method='ffill')
+        tsy_2y = fred_data['tsy_2y'].reindex(date_index, method='ffill')
+        
+        yc_slope = tsy_10y - tsy_2y
+        feats['yc_slope_10_2'] = yc_slope.astype('float32')
+        feats['yc_slope_momentum_21'] = yc_slope.diff(21).astype('float32')
+        
+        # Inversion flag
+        feats['yc_inverted'] = (yc_slope < 0).astype('float32')
+        
+        # Yield curve z-score
+        yc_mean = yc_slope.rolling(252, min_periods=126).mean()
+        yc_std = yc_slope.rolling(252, min_periods=126).std()
+        feats['yc_slope_zscore'] = ((yc_slope - yc_mean) / (yc_std + 1e-8)).astype('float32')
+    
+    if 'tsy_30y' in fred_data and 'tsy_10y' in fred_data and 'tsy_2y' in fred_data:
+        tsy_30y = fred_data['tsy_30y'].reindex(date_index, method='ffill')
+        tsy_10y = fred_data['tsy_10y'].reindex(date_index, method='ffill')
+        tsy_2y = fred_data['tsy_2y'].reindex(date_index, method='ffill')
+        
+        # Curvature (butterfly)
+        curvature = tsy_2y + tsy_30y - 2 * tsy_10y
+        feats['yc_curvature'] = curvature.astype('float32')
+    
+    # Real rate
+    if 'tsy_10y' in fred_data and 'breakeven_10y' in fred_data:
+        tsy_10y = fred_data['tsy_10y'].reindex(date_index, method='ffill')
+        breakeven = fred_data['breakeven_10y'].reindex(date_index, method='ffill')
+        feats['real_rate_10y'] = (tsy_10y - breakeven).astype('float32')
+    
+    # ---- Credit Spread Features ----
+    if 'hy_spread' in fred_data:
+        hy_spread = fred_data['hy_spread'].reindex(date_index, method='ffill')
+        feats['hy_spread'] = hy_spread.astype('float32')
+        feats['hy_spread_momentum_21'] = hy_spread.diff(21).astype('float32')
+        
+        # Credit spread z-score
+        cs_mean = hy_spread.rolling(252, min_periods=126).mean()
+        cs_std = hy_spread.rolling(252, min_periods=126).std()
+        feats['hy_spread_zscore'] = ((hy_spread - cs_mean) / (cs_std + 1e-8)).astype('float32')
+        
+        # Credit stress flag
+        feats['credit_stress'] = (hy_spread > hy_spread.rolling(252).quantile(0.8)).astype('float32')
+    
+    if 'ig_spread' in fred_data and 'hy_spread' in fred_data:
+        ig = fred_data['ig_spread'].reindex(date_index, method='ffill')
+        hy = fred_data['hy_spread'].reindex(date_index, method='ffill')
+        feats['quality_spread'] = (hy - ig).astype('float32')
+    
+    # ---- Financial Conditions ----
+    if 'chicago_fci' in fred_data:
+        fci = fred_data['chicago_fci'].reindex(date_index, method='ffill')
+        feats['fci'] = fci.astype('float32')
+        feats['fci_momentum_21'] = fci.diff(21).astype('float32')
+        
+        # Tight conditions flag (FCI > 0 means tighter than average)
+        feats['fci_tight'] = (fci > 0).astype('float32')
+    
+    if 'stl_fsi' in fred_data:
+        fsi = fred_data['stl_fsi'].reindex(date_index, method='ffill')
+        feats['fsi'] = fsi.astype('float32')
+        feats['fsi_stress'] = (fsi > 0).astype('float32')
+    
+    # ---- Sentiment / Uncertainty ----
+    if 'umich_sentiment' in fred_data:
+        sentiment = fred_data['umich_sentiment'].reindex(date_index, method='ffill')
+        feats['consumer_sentiment'] = sentiment.astype('float32')
+        
+        # Sentiment momentum (3-month change)
+        feats['sentiment_momentum_63'] = sentiment.diff(63).astype('float32')
+        
+        # Sentiment z-score
+        sent_mean = sentiment.rolling(252, min_periods=126).mean()
+        sent_std = sentiment.rolling(252, min_periods=126).std()
+        feats['sentiment_zscore'] = ((sentiment - sent_mean) / (sent_std + 1e-8)).astype('float32')
+    
+    if 'epu_daily' in fred_data:
+        epu = fred_data['epu_daily'].reindex(date_index, method='ffill')
+        feats['epu'] = epu.astype('float32')
+        
+        # EPU z-score
+        epu_mean = epu.rolling(252, min_periods=126).mean()
+        epu_std = epu.rolling(252, min_periods=126).std()
+        feats['epu_zscore'] = ((epu - epu_mean) / (epu_std + 1e-8)).astype('float32')
+        
+        # High uncertainty flag
+        feats['epu_spike'] = (epu > epu.rolling(252).quantile(0.9)).astype('float32')
+    
+    # ---- Initial Claims (Labor Market) ----
+    if 'initial_claims' in fred_data:
+        claims = fred_data['initial_claims'].reindex(date_index, method='ffill')
+        
+        # 4-week moving average
+        claims_4wk = claims.rolling(4, min_periods=2).mean()
+        feats['claims_4wk_ma'] = claims_4wk.astype('float32')
+        
+        # Claims momentum (vs 4 weeks ago)
+        feats['claims_momentum_4w'] = claims_4wk.pct_change(4).astype('float32')
+        
+        # Claims z-score
+        claims_mean = claims_4wk.rolling(252, min_periods=126).mean()
+        claims_std = claims_4wk.rolling(252, min_periods=126).std()
+        feats['claims_zscore'] = ((claims_4wk - claims_mean) / (claims_std + 1e-8)).astype('float32')
+    
+    return feats
+
+
+# ============================================================================
+# COMPOSITE REGIME INDICATOR
+# ============================================================================
+
+def compute_regime_composite(
+    macro_features: Dict[str, pd.Series],
+    vix: pd.Series = None,
+) -> Dict[str, pd.Series]:
+    """
+    Compute composite regime indicators combining multiple signals.
+    
+    Parameters
+    ----------
+    macro_features : Dict[str, pd.Series]
+        Macro features from compute_macro_features_from_fred()
+    vix : pd.Series, optional
+        VIX index values
+        
+    Returns
+    -------
+    Dict[str, pd.Series]
+        - macro_regime_score: -3 to +3 (risk-off to risk-on)
+        - risk_on: Flag for favorable macro conditions
+        - risk_off: Flag for unfavorable macro conditions
+        - vix_zscore: VIX z-score if VIX provided
+    """
+    feats = {}
+    
+    # Get features
+    yc_slope = macro_features.get('yc_slope_10_2')
+    hy_spread = macro_features.get('hy_spread')
+    vix_z = None
+    
+    # Use yc_slope index as reference for alignment
+    ref_index = yc_slope.index if yc_slope is not None else None
+    
+    if vix is not None and ref_index is not None:
+        # Align VIX to macro features index
+        vix_aligned = vix.reindex(ref_index, method='ffill')
+        vix_mean = vix_aligned.rolling(252, min_periods=126).mean()
+        vix_std = vix_aligned.rolling(252, min_periods=126).std()
+        vix_z = (vix_aligned - vix_mean) / (vix_std + 1e-8)
+        feats['vix_zscore'] = vix_z.astype('float32')
+    
+    # Build composite score
+    if yc_slope is not None and hy_spread is not None and vix_z is not None:
+        # Align hy_spread to same index
+        hy_spread_aligned = hy_spread.reindex(ref_index, method='ffill')
+        
+        # Yield curve component: positive slope = risk-on
+        yc_score = np.where(yc_slope > 0.5, 1, np.where(yc_slope < 0, -1, 0))
+        
+        # Credit spread component: low spreads = risk-on
+        cs_pct = hy_spread_aligned.rolling(252, min_periods=126).rank(pct=True)
+        cs_score = np.where(cs_pct < 0.3, 1, np.where(cs_pct > 0.7, -1, 0))
+        
+        # VIX component: low VIX = risk-on
+        vix_score = np.where(vix_z < -0.5, 1, np.where(vix_z > 1, -1, 0))
+        
+        # Composite (-3 to +3)
+        composite = yc_score + cs_score + vix_score
+        feats['macro_regime_score'] = pd.Series(composite, index=ref_index).astype('float32')
+        
+        # Risk-on/off flags
+        feats['risk_on'] = (feats['macro_regime_score'] >= 2).astype('float32')
+        feats['risk_off'] = (feats['macro_regime_score'] <= -2).astype('float32')
+    
+    return feats
+
+
+# ============================================================================
 # PER-TICKER FEATURE ENGINEERING
 # ============================================================================
 

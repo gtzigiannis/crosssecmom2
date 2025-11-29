@@ -58,18 +58,27 @@ FRED_SERIES = {
 }
 
 
+# Default FRED API key (can be overridden by environment variable)
+DEFAULT_FRED_API_KEY = "07aa386a7dd9c675f406da5e79561b8b"
+
+# Benchmark tickers for cross-asset features
+BENCHMARK_TICKERS = ['SPY', 'TLT', 'GLD']
+
+
 class CrossSecMomDataManager:
     """Manages data downloading and caching with incremental updates."""
 
     def __init__(
         self,
         data_dir: Optional[str] = None,
+        fred_api_key: Optional[str] = None,
     ):
         """
         Initialize data manager.
 
         Args:
             data_dir: Directory for data storage. If None, uses default from config.
+            fred_api_key: FRED API key. If None, uses environment variable or default.
         """
         if data_dir is None:
             # Import here to avoid circular dependency
@@ -88,6 +97,12 @@ class CrossSecMomDataManager:
         
         self.fred_dir = self.data_dir / "fred"
         self.fred_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.benchmark_dir = self.data_dir / "benchmarks"
+        self.benchmark_dir.mkdir(parents=True, exist_ok=True)
+        
+        # FRED API key: env var > parameter > default
+        self.fred_api_key = os.environ.get('FRED_API_KEY') or fred_api_key or DEFAULT_FRED_API_KEY
         
         # FRED API client (lazy initialization)
         self._fred = None
@@ -360,6 +375,120 @@ class CrossSecMomDataManager:
 
         return prices, returns
 
+    def load_or_download_benchmark_prices(
+        self,
+        tickers: Optional[List[str]] = None,
+        start_date: str = "2016-01-01",
+        end_date: Optional[str] = None,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Load benchmark prices (SPY, TLT, GLD) for cross-asset features.
+        
+        Uses same yfinance download logic as ETF prices, stored in benchmark_dir.
+        
+        Parameters
+        ----------
+        tickers : List[str], optional
+            Benchmark tickers. Default: BENCHMARK_TICKERS (SPY, TLT, GLD)
+        start_date : str
+            Start date (YYYY-MM-DD)
+        end_date : str, optional
+            End date. Default: today
+            
+        Returns
+        -------
+        Tuple[pd.DataFrame, pd.DataFrame]
+            (prices, returns) DataFrames with benchmark data
+        """
+        tickers = tickers or BENCHMARK_TICKERS
+        end_date = end_date or dt.date.today().isoformat()
+        
+        print(f"[Benchmarks] Loading {tickers} from {start_date} to {end_date}")
+        
+        all_data = {}
+        
+        for ticker in tickers:
+            cache_path = self.benchmark_dir / f"{ticker}.csv"
+            
+            # Try to load cached data
+            cached_data = None
+            if cache_path.exists():
+                try:
+                    df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+                    if 'close' in df.columns:
+                        cached_data = df['close']
+                    elif 'Close' in df.columns:
+                        cached_data = df['Close']
+                    else:
+                        cached_data = df.iloc[:, 0]
+                    
+                    # Ensure timezone-naive
+                    if cached_data.index.tz is not None:
+                        cached_data.index = cached_data.index.tz_localize(None)
+                    
+                    last_date = cached_data.index.max().strftime("%Y-%m-%d")
+                    
+                    # Check if update needed
+                    if last_date >= end_date:
+                        all_data[ticker] = cached_data
+                        print(f"  [OK] {ticker}: {len(cached_data)} days (cached)")
+                        continue
+                        
+                except Exception as e:
+                    print(f"  [WARN] Failed to load cached {ticker}: {e}")
+            
+            # Download from yfinance
+            try:
+                print(f"  Downloading {ticker}...")
+                df = yf.download(
+                    ticker,
+                    start=start_date,
+                    end=end_date,
+                    progress=False,
+                    auto_adjust=True,
+                )
+                
+                if not df.empty:
+                    # Ensure timezone-naive
+                    if df.index.tz is not None:
+                        df.index = df.index.tz_localize(None)
+                    
+                    # Handle multi-level columns from yfinance
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    
+                    price_series = df['Close']
+                    
+                    # Merge with cached if exists
+                    if cached_data is not None:
+                        combined = pd.concat([cached_data, price_series]).sort_index()
+                        combined = combined[~combined.index.duplicated(keep='last')]
+                        price_series = combined
+                    
+                    # Save to cache
+                    pd.DataFrame({'close': price_series}).to_csv(cache_path)
+                    all_data[ticker] = price_series
+                    print(f"  [OK] {ticker}: {len(price_series)} days")
+                else:
+                    print(f"  [ERROR] {ticker}: No data returned")
+                    
+            except Exception as e:
+                print(f"  [ERROR] {ticker}: {e}")
+                if cached_data is not None:
+                    all_data[ticker] = cached_data
+        
+        if not all_data:
+            raise ValueError("No benchmark data available")
+        
+        prices = pd.DataFrame(all_data).sort_index()
+        prices = prices[(prices.index >= start_date) & (prices.index <= end_date)]
+        prices = prices.dropna()
+        returns = np.log(prices / prices.shift(1)).dropna()
+        
+        print(f"[Benchmarks] Loaded: {len(prices)} days, {list(prices.columns)}")
+        
+        return prices, returns
+
     def load_or_download_macro_data(
         self,
         macro_tickers: Dict[str, str],
@@ -549,10 +678,10 @@ class CrossSecMomDataManager:
     def _get_fred_client(self):
         """
         Lazy initialization of FRED API client.
-        Requires FRED_API_KEY environment variable.
+        Uses instance fred_api_key (set from env, parameter, or default).
         """
         if self._fred is None:
-            api_key = os.environ.get('FRED_API_KEY')
+            api_key = self.fred_api_key
             if api_key:
                 try:
                     from fredapi import Fred
