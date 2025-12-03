@@ -1,0 +1,56 @@
+1.
+Stage A: add block-level persistence filter (on top of pooled FDR)
+
+Keep the existing pooled formation-level FDR test (NW t-stat on pooled IC, BH-FDR across features, p_global ≤ alpha_base) and direction-consistency filter.
+
+Add a second requirement using precomputed block stats, for the same formation:
+
+Let mean_IC be the pooled IC over formation.
+
+For each feature, require at least m_base blocks where:
+
+sign(IC_block) == sign(mean_IC), and
+
+|IC_block| ≥ IC_block_min or |t_block| ≥ t_block_min.
+
+A feature passes Stage A only if it passes both:
+
+pooled FDR + direction-consistency, and
+
+block-level persistence (enough blocks with IC of the same sign and non-trivial magnitude).
+
+2.
+Stage B: replace overlapping K-fold CV with non-overlapping block-wise stability selection
+
+Partition the formation+training region into K non-overlapping contiguous time blocks (e.g. 5–10).
+
+For each block b = 1..K:
+
+Fit LassoCV only on that block’s data using features in S_AR.
+
+Mark feature j as selected in block b if its coefficient ≠ 0.
+
+Compute selection frequency per feature:
+
+π_j = (# of blocks where j is selected) / K.
+
+Define multivariate-stable features:
+
+S_stable = { j ∈ S_AR : π_j ≥ π_threshold } (e.g. π_threshold = 0.6).
+
+This replaces the previous “leave-one-fold-out” CV where training sets overlapped; now each block is an independent regime for stability.
+
+3.
+Per-window logic: remove IC-based re-ranking/truncation in training windows
+
+Once Stage A + redundancy + Stage B are done for a formation, treat S_final = S_stable as the fixed feature set for that formation.
+
+For each training–test window inside that formation:
+
+Do not re-rank or filter features by per-window IC or sign consistency.
+
+Fit the final model (e.g. Lasso/Ridge/Elastic Net) on the training window using all features in S_final.
+
+Apply that model to the test window.
+
+Per-window IC and ranks may be computed only for logging/diagnostics, not for gating, truncating, or re-ordering the feature set passed to the model.

@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "D:\REPOSITORY\morias\Quant\strategies\crosssecmom2\scripts\run_wf_smoke_test.py", line 400, in <module>
+    main()
+    ~~~~^^
+  File "D:\REPOSITORY\morias\Quant\strategies\crosssecmom2\scripts\run_wf_smoke_test.py", line 384, in main
+    results = run_smoke_test(
+        n_windows=args.n_windows,
+    ...<2 lines>...
+        verbose=not args.quiet
+    )
+  File "D:\REPOSITORY\morias\Quant\strategies\crosssecmom2\scripts\run_wf_smoke_test.py", line 189, in run_smoke_test
+    from config import get_default_config
+ModuleNotFoundError: No module named 'config'

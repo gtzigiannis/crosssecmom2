@@ -1,0 +1,332 @@
+"""
+Main Entry Point for Cross-Sectional Momentum Research
+=======================================================
+Complete workflow demonstrating the refactored framework.
+
+Usage:
+    python main.py --step [feature_eng|build_metadata|backtest|analyze]
+    
+    Or run all steps:
+    python main.py --all
+"""
+
+# MUST be set BEFORE importing numpy/pandas to avoid Windows Intel MKL threading crashes
+import os
+for var in ("MKL_NUM_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", 
+            "NUMEXPR_NUM_THREADS", "BLAS_NUM_THREADS", "LAPACK_NUM_THREADS"):
+    os.environ.setdefault(var, "1")
+
+import argparse
+import pandas as pd
+from pathlib import Path
+import time
+from datetime import datetime
+
+from config import get_default_config, ResearchConfig
+from universe_metadata import build_universe_metadata, validate_universe_metadata
+from feature_engineering import run_feature_engineering
+from walk_forward_engine import (
+    run_walk_forward_backtest, 
+    analyze_performance
+)
+
+
+def step_1_feature_engineering(config: ResearchConfig):
+    """
+    Step 1: Generate panel data with raw features.
+    
+    Output: panel_parquet with (Date, Ticker) MultiIndex containing:
+    - Close (raw price)
+    - Raw features (returns, momentum, volatility, etc.)
+    - ADV_63, ADV_63_Rank (liquidity)
+    - FwdRet_H (forward returns at HOLDING_PERIOD_DAYS)
+    """
+    print("\n" + "="*80)
+    print("STEP 1: FEATURE ENGINEERING")
+    print("="*80)
+    
+    step_start = time.time()
+    panel_df = run_feature_engineering(config)
+    step_elapsed = time.time() - step_start
+    
+    print(f"\n[done] Panel saved to: {config.paths.panel_parquet}")
+    print(f"[time] Feature engineering completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")
+    return panel_df
+
+
+def step_2_build_metadata(config: ResearchConfig, returns_df=None):
+    """
+    Step 2: Build universe metadata (families, duplicates, clusters, caps).
+    
+    Output: universe_metadata DataFrame with:
+    - family: Economic family classification
+    - dup_group_id: Duplicate group ID (if applicable)
+    - is_dup_canonical: True for canonical ETF in duplicate group
+    - in_core_after_duplicates: True if in core universe
+    - cluster_id: Theme cluster ID
+    - cluster_cap: Max weight per cluster
+    - per_etf_cap: Max weight per ETF
+    """
+    print("\n" + "="*80)
+    print("STEP 2: BUILD UNIVERSE METADATA")
+    print("="*80)
+    
+    step_start = time.time()
+    
+    # Check if universe metadata CSV exists
+    if not Path(config.paths.universe_metadata_csv).exists():
+        print(f"[error] Universe metadata file not found: {config.paths.universe_metadata_csv}")
+        print("[info] Using simple universe file without families/clusters")
+        
+        # Load simple universe and create basic metadata
+        universe_df = pd.read_csv(config.paths.universe_csv)
+        universe_metadata = pd.DataFrame({
+            'ticker': universe_df['ticker'],
+            'name': universe_df.get('name', ''),
+            'family': 'UNKNOWN',
+            'in_core_universe': True,
+            'dup_group_id': pd.NA,
+            'is_dup_canonical': False,
+            'in_core_after_duplicates': True,
+            'cluster_id': pd.NA,
+            'cluster_cap': config.portfolio.default_cluster_cap,
+            'per_etf_cap': config.portfolio.default_per_etf_cap,
+        })
+        
+        cluster_caps = pd.Series(dtype=float)
+    
+    else:
+        # Full metadata build with families, duplicates, clusters
+        universe_metadata, cluster_caps = build_universe_metadata(
+            meta_path=config.paths.universe_metadata_csv,
+            returns_df=returns_df,
+            dup_corr_threshold=config.universe.dup_corr_threshold,
+            max_within_cluster_corr=config.universe.max_within_cluster_corr,
+            default_cluster_cap=config.portfolio.default_cluster_cap,
+            default_per_etf_cap=config.portfolio.default_per_etf_cap,
+            high_risk_cluster_cap=config.portfolio.high_risk_cluster_cap,
+            high_risk_families=config.portfolio.high_risk_families,
+        )
+    
+    # Validate metadata
+    universe_metadata = validate_universe_metadata(universe_metadata, config)
+    
+    # Save metadata
+    universe_metadata.to_csv(config.paths.universe_metadata_output, index=False)
+    print(f"\n[save] Universe metadata saved to: {config.paths.universe_metadata_output}")
+    
+    # Summary
+    print("\n" + "="*80)
+    print("METADATA SUMMARY")
+    print("="*80)
+    print(f"Total ETFs: {len(universe_metadata)}")
+    print(f"Core universe: {universe_metadata['in_core_universe'].sum()}")
+    print(f"After duplicate removal: {universe_metadata['in_core_after_duplicates'].sum()}")
+    
+    if 'family' in universe_metadata.columns:
+        print("\nTop families:")
+        print(universe_metadata['family'].value_counts().head(10))
+    
+    if 'cluster_id' in universe_metadata.columns and universe_metadata['cluster_id'].notna().any():
+        print(f"\nNumber of theme clusters: {universe_metadata['cluster_id'].nunique()}")
+        print(f"Cluster caps range: [{cluster_caps.min():.2%}, {cluster_caps.max():.2%}]")
+    
+    step_elapsed = time.time() - step_start
+    print(f"\n[time] Metadata building completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")
+    
+    return universe_metadata, cluster_caps
+
+
+def step_3_backtest(
+    config: ResearchConfig,
+    panel_df: pd.DataFrame = None,
+    universe_metadata: pd.DataFrame = None,
+    model_type: str = 'supervised_binned'
+):
+    """
+    Step 3: Run walk-forward backtest.
+    
+    At each rebalance date:
+    1. Train model on training window
+    2. Score eligible universe
+    3. Construct portfolio with caps
+    4. Evaluate using forward returns
+    """
+    print("\n" + "="*80)
+    print("STEP 3: WALK-FORWARD BACKTEST")
+    print("="*80)
+    
+    step_start = time.time()
+    
+    # Load data if not provided
+    if panel_df is None:
+        print(f"[load] Loading panel from {config.paths.panel_parquet}")
+        panel_df = pd.read_parquet(config.paths.panel_parquet)
+    
+    if universe_metadata is None:
+        print(f"[load] Loading universe metadata from {config.paths.universe_metadata_output}")
+        universe_metadata = pd.read_csv(config.paths.universe_metadata_output)
+    
+    # Validate metadata before backtest
+    universe_metadata = validate_universe_metadata(universe_metadata, config)
+    
+    # Run backtest
+    results_df = run_walk_forward_backtest(
+        panel_df=panel_df,
+        universe_metadata=universe_metadata,
+        config=config,
+        model_type=model_type,
+        portfolio_method='cvxpy',  # cvxpy optimization (mandatory dependency)
+        verbose=True
+    )
+    
+    # Save results with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_dir = Path(config.paths.results_csv).parent
+    results_filename = f"cs_momentum_results_{timestamp}.csv"
+    results_path = results_dir / results_filename
+    results_df.to_csv(results_path)
+    print(f"\n[save] Results saved to: {results_path}")
+    
+    # Also save as latest for convenience
+    results_df.to_csv(config.paths.results_csv)
+    print(f"[save] Latest results also saved to: {config.paths.results_csv}")
+    
+    step_elapsed = time.time() - step_start
+    print(f"[time] Backtest completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")
+    
+    return results_df
+
+
+def step_4_analyze(config: ResearchConfig, results_df: pd.DataFrame = None):
+    """
+    Step 4: Analyze backtest results.
+    """
+    print("\n" + "="*80)
+    print("STEP 4: ANALYZE RESULTS")
+    print("="*80)
+    
+    step_start = time.time()
+    
+    # Load results if not provided
+    if results_df is None:
+        print(f"[load] Loading results from {config.paths.results_csv}")
+        results_df = pd.read_csv(config.paths.results_csv, index_col=0, parse_dates=True)
+    
+    # Compute statistics
+    stats = analyze_performance(results_df, config)
+    
+    print("\n" + "="*80)
+    print("PERFORMANCE SUMMARY")
+    print("="*80)
+    for key, value in stats.items():
+        print(f"{key:20s}: {value}")
+    
+    # Print attribution analysis if available
+    if hasattr(results_df, 'attrs') and 'attribution' in results_df.attrs:
+        print("\n" + "="*80)
+        print("ATTRIBUTION SUMMARY")
+        print("="*80)
+        
+        attribution = results_df.attrs['attribution']
+        
+        # Feature attribution summary
+        if 'feature_attribution' in attribution and len(attribution['feature_attribution']) > 0:
+            print("\nTop 5 Features by Importance:")
+            for i, row in attribution['feature_attribution'].head(5).iterrows():
+                print(f"  {i+1}. {row['feature']:30s} - Score: {row['importance_score']:.4f}, "
+                      f"Freq: {row['selection_freq']*100:.1f}%, IC: {row['avg_ic']:+.4f}")
+        
+        # Long/short attribution summary
+        if 'long_short_attribution' in attribution:
+            ls_attr = attribution['long_short_attribution']
+            print(f"\nLong/Short Attribution:")
+            print(f"  Long:  {ls_attr['long_total_return']*100:+.2f}% "
+                  f"({ls_attr['long_contribution_pct']:.1f}% of total), "
+                  f"Win Rate: {ls_attr['long_win_rate']:.1f}%")
+            print(f"  Short: {ls_attr['short_total_return']*100:+.2f}% "
+                  f"({ls_attr['short_contribution_pct']:.1f}% of total), "
+                  f"Win Rate: {ls_attr['short_win_rate']:.1f}%")
+        
+        # IC decay summary
+        if 'ic_decay' in attribution and len(attribution['ic_decay']) > 0:
+            ic_decay = attribution['ic_decay']
+            if 'ic_trend' in ic_decay.attrs:
+                trend = ic_decay.attrs['ic_trend']
+                print(f"\nIC Decay Analysis:")
+                print(f"  Trend: {trend['interpretation']} (slope: {trend['slope']:+.6f}, p-value: {trend['p_value']:.4f})")
+        
+        print("\n" + "="*80)
+        print(f"Full attribution results saved to: {config.paths.data_dir}/attribution_*.csv")
+        print("="*80)
+    
+    step_elapsed = time.time() - step_start
+    print(f"\n[time] Analysis completed in {step_elapsed:.2f} seconds ({step_elapsed/60:.2f} minutes)")
+    
+    return stats
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Cross-Sectional Momentum Research')
+    parser.add_argument('--step', type=str, 
+                       choices=['feature_eng', 'build_metadata', 'backtest', 'analyze', 'all'],
+                       default='all',
+                       help='Which step to run')
+    parser.add_argument('--model', type=str,
+                       choices=['momentum_rank', 'supervised_binned'],
+                       default='supervised_binned',
+                       help='Model type for backtest')
+    parser.add_argument('--config', type=str, default=None,
+                       help='Path to custom config file (optional)')
+    
+    args = parser.parse_args()
+    
+    # Load configuration
+    if args.config:
+        # TODO: Implement custom config loading
+        config = get_default_config()
+    else:
+        config = get_default_config()
+    
+    print("="*80)
+    print("CROSS-SECTIONAL MOMENTUM RESEARCH FRAMEWORK")
+    print("="*80)
+    print(f"Configuration:")
+    print(f"  Training window: {config.time.TRAINING_WINDOW_DAYS} days")
+    print(f"  Holding period: {config.time.HOLDING_PERIOD_DAYS} days")
+    print(f"  Feature max lag: {config.time.FEATURE_MAX_LAG_DAYS} days")
+    print(f"  Model type: {args.model}")
+    
+    # Start overall timer
+    overall_start = time.time()
+    
+    # Execute requested step(s)
+    if args.step == 'feature_eng' or args.step == 'all':
+        panel_df = step_1_feature_engineering(config)
+    else:
+        panel_df = None
+    
+    if args.step == 'build_metadata' or args.step == 'all':
+        universe_metadata, cluster_caps = step_2_build_metadata(config, returns_df=None)
+    else:
+        universe_metadata = None
+    
+    if args.step == 'backtest' or args.step == 'all':
+        results_df = step_3_backtest(config, panel_df, universe_metadata, args.model)
+    else:
+        results_df = None
+    
+    if args.step == 'analyze' or args.step == 'all':
+        stats = step_4_analyze(config, results_df)
+    
+    # Calculate total elapsed time
+    overall_elapsed = time.time() - overall_start
+    
+    print("\n" + "="*80)
+    print("COMPLETE")
+    print("="*80)
+    print(f"[time] Total execution time: {overall_elapsed:.2f} seconds ({overall_elapsed/60:.2f} minutes, {overall_elapsed/3600:.2f} hours)")
+
+
+if __name__ == "__main__":
+    main()
