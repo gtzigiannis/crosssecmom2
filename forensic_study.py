@@ -221,30 +221,48 @@ class ForensicStudy:
         for idx, row in self.results_df.iterrows():
             period_holdings = {
                 'date': idx,
-                'long_tickers': {},
-                'short_tickers': {},
+                'long_tickers': [],
+                'short_tickers': [],
                 'ls_return': row.get('ls_return', 0.0),
                 'long_ret': row.get('long_ret', 0.0),
                 'short_ret': row.get('short_ret', 0.0),
             }
             
-            # Parse long tickers
-            if 'long_tickers' in row and pd.notna(row['long_tickers']):
+            # Parse long tickers - could be list, dict, or string
+            if 'long_tickers' in row.index:
+                lt = row['long_tickers']
                 try:
-                    if isinstance(row['long_tickers'], str):
-                        period_holdings['long_tickers'] = ast.literal_eval(row['long_tickers'])
-                    elif isinstance(row['long_tickers'], dict):
-                        period_holdings['long_tickers'] = row['long_tickers']
+                    if isinstance(lt, list):
+                        period_holdings['long_tickers'] = lt
+                    elif isinstance(lt, dict):
+                        period_holdings['long_tickers'] = list(lt.keys())
+                    elif isinstance(lt, str):
+                        parsed = ast.literal_eval(lt)
+                        if isinstance(parsed, list):
+                            period_holdings['long_tickers'] = parsed
+                        elif isinstance(parsed, dict):
+                            period_holdings['long_tickers'] = list(parsed.keys())
+                    elif isinstance(lt, np.ndarray):
+                        period_holdings['long_tickers'] = lt.tolist()
                 except:
                     pass
             
             # Parse short tickers
-            if 'short_tickers' in row and pd.notna(row['short_tickers']):
+            if 'short_tickers' in row.index:
+                st = row['short_tickers']
                 try:
-                    if isinstance(row['short_tickers'], str):
-                        period_holdings['short_tickers'] = ast.literal_eval(row['short_tickers'])
-                    elif isinstance(row['short_tickers'], dict):
-                        period_holdings['short_tickers'] = row['short_tickers']
+                    if isinstance(st, list):
+                        period_holdings['short_tickers'] = st
+                    elif isinstance(st, dict):
+                        period_holdings['short_tickers'] = list(st.keys())
+                    elif isinstance(st, str):
+                        parsed = ast.literal_eval(st)
+                        if isinstance(parsed, list):
+                            period_holdings['short_tickers'] = parsed
+                        elif isinstance(parsed, dict):
+                            period_holdings['short_tickers'] = list(parsed.keys())
+                    elif isinstance(st, np.ndarray):
+                        period_holdings['short_tickers'] = st.tolist()
                 except:
                     pass
             
@@ -805,20 +823,24 @@ class ForensicStudy:
                 
                 # Get holdings for this period
                 holdings = self.holdings[i] if i < len(self.holdings) else {}
-                long_tickers = holdings.get('long_tickers', {})
-                short_tickers = holdings.get('short_tickers', {})
+                long_tickers = holdings.get('long_tickers', [])
+                short_tickers = holdings.get('short_tickers', [])
+                
+                # Convert to list if dict (for backwards compatibility)
+                if isinstance(long_tickers, dict):
+                    long_tickers = list(long_tickers.keys())
+                if isinstance(short_tickers, dict):
+                    short_tickers = list(short_tickers.keys())
                 
                 # 2.1.6: Rank accuracy - correlation of held positions with returns
-                if long_tickers and short_tickers:
-                    held_long = list(long_tickers.keys())
-                    held_short = list(short_tickers.keys())
-                    
+                if long_tickers or short_tickers:
                     # Compute rank IC based on long/short classification
-                    all_held = held_long + held_short
+                    all_held = list(long_tickers) + list(short_tickers)
                     if all_held:
                         positions = pd.Series(index=all_held, dtype=float)
-                        positions.loc[held_long] = 1.0
-                        positions.loc[held_short] = -1.0
+                        positions.loc[list(long_tickers)] = 1.0
+                        if short_tickers:
+                            positions.loc[list(short_tickers)] = -1.0
                         
                         held_rets = fwd_rets.reindex(all_held).dropna()
                         positions = positions.reindex(held_rets.index)
@@ -1184,9 +1206,9 @@ class ForensicStudy:
         for file in self.config.output_dir.glob("*"):
             report_lines.append(f"- `{file.name}`")
         
-        # Write report
+        # Write report with UTF-8 encoding
         report_path = self.config.output_dir / "FORENSIC_SUMMARY.md"
-        with open(report_path, 'w') as f:
+        with open(report_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(report_lines))
         
         print(f"\n  Summary report: {report_path}")
