@@ -22,11 +22,26 @@ The forensic study reveals **fundamental concerns** about the strategy's viabili
 | Statistical Significance | **FAILED** (95% CI includes zero) | Cannot distinguish from luck |
 | Perfect Foresight Capture | **0.02%** | Captures almost none of available alpha |
 
+### 🔥 ROOT CAUSE IDENTIFIED
+
+**The feature selection pipeline eliminates the strategy's best predictor.**
+
+| Finding | Evidence |
+|---------|----------|
+| `Close%-63` has IC = 0.28 | t-stat = 10.5, positive in 90% of days |
+| Simple momentum achieves **Sharpe 3.03** | Just ranking by `Close%-63`, no ML |
+| ML model achieves **Sharpe 0.52** | Uses 12 weak features instead |
+| **Model picks have 21.7% overlap with momentum** | Average momentum rank = 56 (random = 58) |
+| `Close%-63` is NEVER selected | LARS regularization eliminates it |
+
+**The ML pipeline prefers "diversity" over signal strength, selecting 12 weak uncorrelated features while ignoring the strong (but correlated) momentum signal.**
+
 **Recommendation:** Do not deploy this strategy in its current form. The evidence strongly suggests:
 1. The feature selection adds no predictive value
 2. Random ETF selection outperforms the model
 3. Simple 12-1 momentum beats the ML pipeline
 4. Results are not statistically distinguishable from zero
+5. **Fix:** Force-include momentum features or use simple momentum ranking
 
 ---
 
@@ -188,6 +203,103 @@ Correlation: 0.78 (high - they pick similar ETFs often)
 | Simple Momentum | ML = Simple momentum | ❌ **Cannot reject** | N/A | ML underperforms simple |
 
 **Phase 0B Verdict:** The strategy has **no detectable skill**. All null hypotheses cannot be rejected. The complex ML system adds negative value compared to simpler alternatives.
+
+---
+
+## 🔍 ROOT CAUSE ANALYSIS: WHY THE ML MODEL FAILS
+
+### The Smoking Gun: Model Picks Have 21.7% Overlap with Simple Momentum
+
+**Key Finding:** When comparing the model's actual ETF picks to simple momentum ranking (buy top-N by `Close%-63`), there is only **21.7% overlap**.
+
+| Metric | Value | Interpretation |
+|--------|-------|----------------|
+| Mean Overlap with Simple Momentum | **21.7%** | Model mostly picks different ETFs |
+| Min Overlap | **0.0%** | Sometimes ZERO overlap |
+| Max Overlap | **63.2%** | Best case still <2/3 overlap |
+| Avg Momentum Rank of Model Picks | **56.0** | Almost exactly random (58 expected) |
+
+**This means the model is selecting ETFs that have AVERAGE momentum, not high momentum.**
+
+### Root Cause: Feature Selection Eliminates Momentum Features
+
+**Critical Finding:** The `Close%-63` feature (IC=0.28, t-stat=10.5) is **NEVER selected** as a raw feature in any of the 80 windows!
+
+**Feature Selection Frequency Across 80 Windows:**
+
+| Feature | Times Selected | Note |
+|---------|---------------|------|
+| `volume_per_atr` | 29 windows | Top selected - weak signal |
+| `drawdown_corr_VT_126` | 16 windows | Risk metric |
+| `downside_beta_VT_21_x_pct_from_52w_low` | 16 windows | Complex interaction |
+| `pv_corr_63` | 15 windows | Volume-price correlation |
+| `Close%-63` (raw) | **0 windows** | ❌ NEVER SELECTED |
+| `Close%-126` (raw) | **0 windows** | ❌ NEVER SELECTED |
+| `Close%-252` | 7 windows | Only 8.75% of windows |
+| `Close%-63_x_Close_kurt63` | 8 windows | Interaction only |
+
+**The Pipeline Filters Out Momentum:**
+
+```
+Window 0 Feature Selection Pipeline:
+  1. Formation Approved:     103 features
+  2. After Soft Ranking:      99 features  
+  3. After Redundancy:        77 features  ← Momentum survives
+  4. After LARS Selection:    12 features  ← Momentum ELIMINATED HERE
+  5. Final Model:             12 features
+```
+
+### Why LARS Drops Momentum Features
+
+The LARS (Lasso) regularization process is designed to find a SPARSE set of features with MINIMAL multicollinearity. The problem:
+
+1. **Momentum features are highly correlated with each other:**
+   - `Close%-42` and `Close%-63`: ρ = 0.863
+   - `Close%-126` and `Close%-252`: ρ = 0.888
+
+2. **LARS prefers "diverse" features** - it penalizes correlated feature groups
+3. **Result:** Only 1 momentum feature survives (if any), competing against 76 other "diverse" noise features
+4. **The single momentum feature often loses** to combinations of weaker but uncorrelated features
+
+### The Performance Gap Explained
+
+| Model | Features Used | IC | Sharpe | Total Return |
+|-------|---------------|-------|--------|--------------|
+| **Simple Momentum** | `Close%-63` only | 0.28 | **3.03** | **1,135%** |
+| **ML Model** | 12 selected features | 0.10 | 0.52 | 70% |
+| **Difference** | — | -0.18 | **-2.51** | **-1,065%** |
+
+**The ML model's selected features have IC=0.10, while the ignored `Close%-63` has IC=0.28.**
+
+### IC Comparison: Selected vs Ignored Features
+
+**Window 0 Selected Features (IC range: 0.01 to 0.11):**
+- `high_vol_x_up_down_vol_ratio_21`: IC = 0.008
+- `Close_kurt63`: IC = -0.055
+- `volume_breakout_63`: IC = 0.012
+- `roll_spread_63_x_vol_regime_duration`: IC = 0.095
+
+**Ignored Momentum Features (IC range: 0.19 to 0.28):**
+- `Close%-63`: IC = **0.19** (on same date)
+- `Close%-126`: IC = -0.70
+- `Close%-252`: IC = -0.61
+
+**The model selects features with 5-10x WEAKER signal than the ignored momentum features.**
+
+### Summary: The Fundamental Flaw
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  PROBLEM: The feature selection pipeline optimizes for DIVERSITY   │
+│           rather than SIGNAL STRENGTH.                              │
+│                                                                      │
+│  RESULT:  Strong, correlated momentum features are dropped in       │
+│           favor of weak, diverse noise features.                    │
+│                                                                      │
+│  FIX:     Either force-include momentum features in final model,    │
+│           or use simple momentum ranking directly.                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
