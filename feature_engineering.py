@@ -79,7 +79,16 @@ FACTOR_GROUPS = {
         'target_representatives': 4,
     },
     'interaction': {
-        'patterns': ['_x_', '_div_', '_minus_', '_sq', '_cb', '_in_'],
+        # Interaction features combine TWO different features:
+        #   _x_    : A × B (multiplicative)
+        #   _div_  : A / B (division)
+        #   _minus_: A - B (subtraction)
+        #   _in_   : A × regime_flag (regime-conditional)
+        # 
+        # NOT interactions (single-feature transformations, these are BASE):
+        #   _sq: A² (squared) - transformation of ONE feature
+        #   _cb: A³ (cubed) - transformation of ONE feature
+        'patterns': ['_x_', '_div_', '_minus_', '_in_'],
         'target_representatives': 10,
     },
 }

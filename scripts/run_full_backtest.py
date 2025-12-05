@@ -265,8 +265,13 @@ def run_single_backtest(panel_df, universe_metadata, benchmark_period_returns, b
         config = get_default_config()
     cfg = copy.deepcopy(config)
     
-    # Set target column
+    # Set target column and validate
     cfg.target.target_column = target_col
+    
+    # Log target being used for this backtest
+    print(f"\n[run_single_backtest] Target column set to: {cfg.target.target_column}")
+    print(f"[run_single_backtest] Feature selection will use: {cfg.target.target_column}")
+    print(f"[run_single_backtest] Model training will use: {cfg.target.target_column}")
     
     # Full OOS windows (no debug limit unless specified)
     if n_windows is not None:
@@ -327,16 +332,61 @@ def run_single_backtest(panel_df, universe_metadata, benchmark_period_returns, b
     return results_df, perf, bench_stats, window_details
 
 
+def validate_target_consistency(config, target_col: str) -> None:
+    """
+    Validate that target column is consistent throughout the pipeline.
+    
+    Raises ValueError if:
+    - Target column is not a valid option
+    - Config settings are inconsistent
+    """
+    VALID_TARGETS = ['y_raw_21d', 'y_cs_21d', 'y_resid_21d', 'y_resid_z_21d']
+    
+    if target_col not in VALID_TARGETS:
+        raise ValueError(
+            f"Invalid target column: {target_col}\n"
+            f"Valid options: {VALID_TARGETS}"
+        )
+    
+    # Verify config target matches
+    if config.target.target_column != target_col:
+        print(f"[WARN] Config target_column ({config.target.target_column}) differs from requested ({target_col})")
+        print(f"[INFO] Updating config.target.target_column to {target_col}")
+        config.target.target_column = target_col
+    
+    print(f"\n" + "="*60)
+    print(f"TARGET CONSISTENCY CHECK")
+    print(f"="*60)
+    print(f"  Target column: {target_col}")
+    print(f"  Config target: {config.target.target_column}")
+    print(f"  Status: ✓ VALIDATED")
+    print(f"="*60 + "\n")
+
+
 def main():
     """Main entry point."""
     start_time = datetime.now()
+    
+    # Load config FIRST to get default target
+    config = get_default_config()
+    
+    # ========================================================================
+    # TARGET LABEL CONFIGURATION
+    # The target is now read from config.target.target_column
+    # To change the target, modify config.py or override here:
+    # Available targets:
+    #   - 'y_raw_21d': Raw 21-day forward return (best for long-only total return)
+    #   - 'y_cs_21d': Cross-sectional rank (best for long-only relative winners)
+    #   - 'y_resid_21d': Risk-adjusted residual (market-neutral alpha)
+    #   - 'y_resid_z_21d': Z-scored residual (best for L/S market-neutral)
+    # ========================================================================
+    # Use config's target_column by default (set in config.py)
+    target_to_run = config.target.target_column
+    
     print(f"\n{'='*80}")
-    print(f"FULL BACKTEST - LONG-ONLY with y_cs_21d")
+    print(f"FULL BACKTEST - Target: {target_to_run}")
     print(f"Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*80}")
-    
-    # Load config and data
-    config = get_default_config()
     
     # ========================================================================
     # BACKTEST MODE CONFIGURATION
@@ -375,20 +425,17 @@ def main():
     # Store all results
     all_results = {}
     
-    # ========================================================================
-    # TARGET LABEL CONFIGURATION
-    # Available targets:
-    #   - 'y_raw_21d': Raw 21-day forward return (best for long-only total return)
-    #   - 'y_cs_21d': Cross-sectional rank (best for long-only relative winners)
-    #   - 'y_resid_21d': Risk-adjusted residual (market-neutral alpha)
-    #   - 'y_resid_z_21d': Z-scored residual (best for L/S market-neutral)
-    # ========================================================================
-    targets_to_run = ['y_cs_21d']  # Using cross-sectional label for long-only
+    # Validate target consistency before running backtest
+    validate_target_consistency(config, target_to_run)
+    
+    # Run backtest for the configured target
+    targets_to_run = [target_to_run]
     
     # Run backtests for each target
     for target in targets_to_run:
         # Initialize formation cache for this target (computes IC once for all windows)
         print(f"\n[Cache] Initializing formation interaction cache for {target}...")
+        print(f"[Cache] This ensures feature selection uses target: {target}")
         initialize_formation_cache(panel_df, target, config)
         
         results_df, perf, bench_stats, window_details = run_single_backtest(

@@ -1,6 +1,6 @@
 # Feature Selection Pipeline
 
-**Goal: Find features whose signal is PERSISTENT and REAL, not noise that passes statistical tests.**
+**Goal: Find features whose signal is PERSISTENT and REAL**
 
 ## Core Principles
 
@@ -161,6 +161,8 @@ For the current formation–training–test step:
 ## 2. Key Properties
 
 - **No economic priors** - everything is data-driven.
+- **No Mutual Information (MI)** - uses only IC (Spearman correlation) for signal measurement. MI is computationally expensive and adds no value over IC for linear predictability.
+- **No early stopping** - LassoCV uses full cross-validation to select optimal regularization. No early stopping callbacks or patience parameters.
 - **Four-gate filtering** - FDR significance, IC floor, direction consistency, and block-level persistence.
 - **Block-level persistence** - features must show signal in multiple independent time blocks, not just pooled.
 - **Parent pre-filtering** - interactions dropped if both parents are clearly bad (reduces noise and computation).

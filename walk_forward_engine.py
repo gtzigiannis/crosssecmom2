@@ -111,24 +111,23 @@ def compute_formation_artifacts(
         return None
     
     # Prepare data for formation_fdr
-    # Use configured target column (y_resid_z_21d by default) or fallback to raw FwdRet
+    # Use configured target column from config (SINGLE SOURCE OF TRUTH)
     target_col = config.target.target_column
     raw_target_col = f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}'
     
-    # Check for configured target column first
+    # Validate target column exists - DO NOT silently fall back
     if target_col not in panel_formation.columns:
-        if verbose:
-            print(f"[warn] Configured target column '{target_col}' not found, falling back to '{raw_target_col}'")
-        target_col = raw_target_col
+        available_targets = [c for c in panel_formation.columns if c.startswith('y_') or c.startswith('FwdRet')]
+        raise ValueError(
+            f"[CRITICAL] Configured target column '{target_col}' not found in panel!\\n"
+            f"Available target-like columns: {available_targets}\\n"
+            f"This suggests a mismatch between config and data."
+        )
     
-    if target_col not in panel_formation.columns:
-        if verbose:
-            print(f"[warn] Target column {target_col} not found in Formation panel")
-        return None
-    
-    # Log target column being used
+    # Log target column being used (CRITICAL for verification)
     if verbose:
-        print(f"[formation] Using target column: {target_col}")
+        print(f"[formation] *** USING TARGET: {target_col} ***")
+        print(f"[formation] Feature selection will be performed against: {target_col}")
     
     # Identify feature columns (exclude non-feature columns and all target variants)
     target_columns = [raw_target_col, 'y_raw_21d', 'y_cs_21d', 'y_resid_21d', 'y_resid_z_21d']

@@ -3581,7 +3581,7 @@ def per_window_pipeline_v3(
             max_features=getattr(config.features, 'kfold_max_features', 50),
             ridge_alpha=config.features.ridge_refit_alpha,
             n_jobs=n_jobs,
-            use_block_only=getattr(config.features, 'kfold_use_block_only', False)  # Default: overlapping CV
+            use_block_only=getattr(config.features, 'kfold_use_block_only', False)  # Default: leave-one-out CV
         )
         mode_str = "non-overlapping" if getattr(config.features, 'kfold_use_block_only', False) else "leave-one-out"
         method_name = f"K-Fold LassoCV ({config.features.kfold_n_splits} blocks, {mode_str})"
@@ -3847,19 +3847,23 @@ def train_window_model(
     dates_train = panel.index.get_level_values('Date').unique().sort_values()
     
     # Identify feature columns (exclude target and metadata columns)
-    # Use configured target column (y_resid_z_21d by default) or fallback to raw FwdRet
+    # Use configured target column from config (SINGLE SOURCE OF TRUTH)
     target_col = config.target.target_column
     raw_target_col = f'FwdRet_{config.time.HOLDING_PERIOD_DAYS}'
     
-    # Check for configured target column first, then fallback
+    # Validate target column exists - DO NOT silently fall back
     if target_col not in panel.columns:
-        logger.warning(f"Configured target '{target_col}' not found, trying '{raw_target_col}'")
-        target_col = raw_target_col
-    if target_col not in panel.columns:
-        # Fall back to alternative naming convention
-        target_col = f'ret_fwd_{config.time.HOLDING_PERIOD_DAYS}d'
+        available_targets = [c for c in panel.columns if c.startswith('y_') or c.startswith('FwdRet')]
+        raise ValueError(
+            f"[CRITICAL] Configured target column '{target_col}' not found in panel!\n"
+            f"Available target-like columns: {available_targets}\n"
+            f"This suggests a mismatch between config and data."
+        )
     
-    logger.info(f"Using target column: {target_col}")
+    logger.info(f"[train_window_model] *** USING TARGET: {target_col} ***")
+    print(f"[train_window_model] Model training against target: {target_col}")
+    
+    # Exclude all target columns (raw FwdRet and computed y_* targets)
     
     # Exclude all target columns (raw FwdRet and computed y_* targets)
     target_columns = [
